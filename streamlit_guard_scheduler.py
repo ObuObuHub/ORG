@@ -1,47 +1,47 @@
-if st.sidebar.checkbox("🎲 Folosește seed fix", help="Pentru rezultate reproductibile"):
-                    seed = st.sidebar.number_input("Seed", min_value=0, value=42)
-                    random.seed(seed)
-
-Aplicație Streamlit pentru gestionarea programului de gărzi medicale.
-Versiune îmbunătățită cu algoritm mai inteligent și interfață mai prietenoasă.
-
-2025-06-15 v5.0 (Enhanced & User-Friendly)
-────────────────
-• ALGORITM ÎMBUNĂTĂȚIT: Distribuție mai echitabilă a gărzilor
-• UI/UX: Interfață mai intuitivă cu statistici și validări
-• ROBUSTEȚE: Gestionare mai bună a erorilor și cazurilor speciale
-• FUNCȚII NOI: Export PDF, statistici detaliate, preferințe medici
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+Aplicație Streamlit pentru gestionarea programului de gărzi medicale.
+Versiune îmbunătățită cu algoritm inteligent și interfață prietenoasă.
+
+Versiune: 5.0
+Data: 2025-06-15
+Autor: Asistent AI pentru comunitatea medicală
+"""
+
+# Importuri necesare
 from __future__ import annotations
-
-import datetime as dt
-from typing import Dict, List, Set, Tuple, Optional
-from collections import defaultdict
-import random
-import io
-
-import altair as alt
-import pandas as pd
 import streamlit as st
-from google.oauth2.service_account import Credentials
+import pandas as pd
+import numpy as np
+from datetime import datetime as dt, timedelta, date
+import locale
 import gspread
-from gspread.utils import rowcol_to_a1
+from google.oauth2.service_account import Credentials
+from collections import defaultdict
+import io
+import time
+from typing import List, Dict, Optional
+import random
+import altair as alt
 
 # ──────────────────────────────────────────────────────────
 # CONSTANTE
 # ──────────────────────────────────────────────────────────
+# Nume foi în Google Sheets
 SHEET_DOCTORS = "Doctors"
 SHEET_SCHEDULE = "Schedule"
 SHEET_UNAVAIL = "Unavailability"
-SHEET_PREFERENCES = "Preferences"  # NOU: pentru preferințe
+SHEET_PREFERENCES = "Preferences"
+SHEET_EXCHANGES = "Exchanges"
 
-# Coloane pentru medici
+# Coloane pentru personal medical
 COL_ID = "id"
 COL_NAME = "name"
 COL_SPEC = "speciality"
 COL_MAX = "max_shifts_per_month"
-COL_PHONE = "phone"  # NOU
-COL_EMAIL = "email"  # NOU
+COL_PHONE = "phone"
+COL_EMAIL = "email"
 
 # Coloane pentru program
 COL_DATE = "date"
@@ -51,40 +51,117 @@ COL_DOC_ID = "doctor_id"
 # Coloane pentru indisponibilități
 COL_UNAV_DOC = "doctor_id"
 COL_UNAV_DATE = "date"
-COL_UNAV_REASON = "reason"  # NOU: motiv indisponibilitate
+COL_UNAV_REASON = "reason"
 
 # Coloane pentru preferințe
 COL_PREF_DOC = "doctor_id"
-COL_PREF_DAY = "preferred_day"  # 0=Luni, 6=Duminică
+COL_PREF_DAY = "preferred_day"
 COL_PREF_SHIFT = "preferred_shift"
 
-# Tipuri de ture - doar 12h și 24h pentru acoperire continuă
+# Coloane pentru schimburi
+COL_EX_FROM = "from_doctor_id"
+COL_EX_TO = "to_doctor_id"
+COL_EX_DATE = "exchange_date"
+COL_EX_SHIFT = "shift_name"
+COL_EX_STATUS = "status"
+COL_EX_REQUESTED = "requested_at"
+
+# Tipuri de ture
 SHIFT_TYPES = {
     1: ["Gardă 24h"],
     2: ["Gardă Zi 12h (08-20)", "Gardă Noapte 12h (20-08)"],
 }
 
 # ---------------------------------------------------------------------------
-# Funcții ajutătoare pentru stilizare
+# Funcții helper pentru stilizare
 # ---------------------------------------------------------------------------
 def get_shift_color(shift_name: str) -> str:
     """Returnează culoarea pentru tipul de tură."""
     colors = {
-        "24h": "#FF6B6B",
-        "Zi": "#4ECDC4",
-        "Noapte": "#45B7D1",
-        "Tură 1": "#96CEB4",
-        "Tură 2": "#FECA57",
-        "Tură 3": "#DDA0DD",
+        "24h": "#dc3545",       # Roșu pentru 24h
+        "Zi": "#28a745",        # Verde pentru zi
+        "Noapte": "#007bff",    # Albastru pentru noapte
     }
     for key, color in colors.items():
         if key in shift_name:
             return color
-    return "#95A5A6"
+    return "#6c757d"  # Gri pentru altele
 
-# ---------------------------------------------------------------------------
-# Wrappers pentru Google Sheets
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────
+# Hospital selector helpers (TREBUIE SĂ FIE PRIMELE!)
+# ──────────────────────────────────────────────────────────
+def get_hospital_config() -> Dict[str, Dict[str, str]]:
+    """
+    Returnează configurația spitalelor din secrets.
+    Suportă atât configurație single-spital cât și multi-spital.
+    """
+    # Verifică mai întâi dacă avem configurație multi-spital
+    if "hospitals" in st.secrets:
+        return st.secrets["hospitals"].to_dict()
+    
+    # Fallback la configurație single-spital pentru compatibilitate
+    if "sheet_id" in st.secrets:
+        return {
+            "default": {
+                "name": "Spital Principal",
+                "sheet_id": st.secrets["sheet_id"]
+            }
+        }
+    
+    # Dacă nu avem nicio configurație
+    st.error("❌ Nu există configurație pentru spitale în secrets.toml!")
+    st.info("""
+    💡 Adaugă în secrets.toml:
+    ```toml
+    [hospitals]
+      [hospitals.piatra_neamt]
+      name = "Spital Piatra Neamț"
+      sheet_id = "ID_FOAIE_GOOGLE"
+    ```
+    """)
+    st.stop()
+
+def select_hospital() -> str:
+    """
+    Afișează un selector în sidebar și returnează sheet_id ales.
+    Salvează selecția în st.session_state['selected_hospital'].
+    """
+    hospitals = get_hospital_config()
+    
+    # Extrage cheile și numele
+    keys = list(hospitals.keys())
+    names = [hospitals[k].get("name", k) for k in keys]
+    
+    # Dacă avem un singur spital, nu afișăm selector
+    if len(keys) == 1:
+        st.session_state["selected_hospital"] = keys[0]
+        return hospitals[keys[0]]["sheet_id"]
+    
+    # Determină indexul implicit
+    current_selection = st.session_state.get("selected_hospital", keys[0])
+    if current_selection in keys:
+        default_idx = keys.index(current_selection)
+    else:
+        default_idx = 0
+    
+    # Afișează selectorul în sidebar
+    with st.sidebar:
+        st.markdown("### 🏥 Selectează Spitalul")
+        idx = st.selectbox(
+            "Alege spitalul:",
+            range(len(keys)),
+            format_func=lambda i: names[i],
+            index=default_idx,
+            key="hospital_selector_widget"
+        )
+    
+    # Salvează selecția
+    st.session_state["selected_hospital"] = keys[idx]
+    return hospitals[keys[idx]]["sheet_id"]
+
+# ──────────────────────────────────────────────────────────
+# Funcții pentru Google Sheets
+# ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="🔗 Conectare la Google Sheets...")
 def get_gsheet_client() -> gspread.Client:
     """Creează și returnează clientul Google Sheets."""
@@ -119,8 +196,13 @@ def load_data(sheet_name: str) -> pd.DataFrame:
     """Încarcă și curăță datele dintr-o foaie."""
     client = get_gsheet_client()
     
+    # Verifică dacă avem sheet_id în session_state
+    if "sheet_id" not in st.session_state:
+        st.error("❌ Nu s-a selectat niciun spital!")
+        return pd.DataFrame()
+    
     try:
-        sh = client.open_by_key(st.secrets["sheet_id"])
+        sh = client.open_by_key(st.session_state["sheet_id"])
     except Exception as e:
         st.error(f"❌ Nu pot accesa foaia de calcul: {str(e)}")
         st.info("💡 Verifică ID-ul foii în secrets.toml")
@@ -132,6 +214,7 @@ def load_data(sheet_name: str) -> pd.DataFrame:
         SHEET_SCHEDULE: [COL_DATE, COL_SHIFT, COL_DOC_ID],
         SHEET_UNAVAIL: [COL_UNAV_DOC, COL_UNAV_DATE, COL_UNAV_REASON],
         SHEET_PREFERENCES: [COL_PREF_DOC, COL_PREF_DAY, COL_PREF_SHIFT],
+        SHEET_EXCHANGES: [COL_EX_FROM, COL_EX_TO, COL_EX_DATE, COL_EX_SHIFT, COL_EX_STATUS, COL_EX_REQUESTED],
     }
     
     headers = headers_map.get(sheet_name, [])
@@ -157,7 +240,7 @@ def load_data(sheet_name: str) -> pd.DataFrame:
     return df
 
 def clean_doctors_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Curăță și validează datele medicilor."""
+    """Curăță și validează datele personalului medical."""
     # Asigură existența coloanelor
     required_cols = [COL_ID, COL_NAME, COL_SPEC, COL_MAX, COL_PHONE, COL_EMAIL]
     for col in required_cols:
@@ -231,7 +314,13 @@ def clean_preferences_data(df: pd.DataFrame) -> pd.DataFrame:
 def save_data(sheet_name: str, df: pd.DataFrame) -> None:
     """Salvează datele înapoi în Google Sheets."""
     client = get_gsheet_client()
-    sh = client.open_by_key(st.secrets["sheet_id"])
+    
+    # Verifică dacă avem sheet_id
+    if "sheet_id" not in st.session_state:
+        st.error("❌ Nu s-a selectat niciun spital!")
+        return
+    
+    sh = client.open_by_key(st.session_state["sheet_id"])
     
     headers = list(df.columns)
     ws = ensure_worksheet(sh, sheet_name, headers)
@@ -277,10 +366,10 @@ class SmartScheduler:
         
         # Contoare pentru distribuție echitabilă
         self.shift_counts = defaultdict(lambda: defaultdict(int))
-        self.last_shift_date = defaultdict(lambda: dt.date.min)
+        self.last_shift_date = defaultdict(lambda: date.min)
         self.weekend_counts = defaultdict(int)
         
-    def calculate_doctor_score(self, doc_id: int, date: dt.date, shift_name: str) -> float:
+    def calculate_doctor_score(self, doc_id: int, date: date, shift_name: str) -> float:
         """Calculează scorul unui medic pentru o anumită gardă."""
         score = 0.0
         
@@ -319,11 +408,11 @@ class SmartScheduler:
         
         return score
     
-    def generate(self, start_date: dt.date, end_date: dt.date, 
+    def generate(self, start_date: date, end_date: date, 
                  shifts_per_day: int) -> pd.DataFrame:
         """Generează programul optimizat."""
         if not self.doctor_ids:
-            raise ValueError("❌ Nu există medici înregistrați!")
+            raise ValueError("❌ Nu există personal înregistrat!")
         
         shifts = SHIFT_TYPES.get(shifts_per_day, [f"Tură {i+1}" for i in range(shifts_per_day)])
         schedule_rows = []
@@ -351,7 +440,7 @@ class SmartScheduler:
                 if not available:
                     # Situație de urgență - alege aleatoriu
                     st.warning(f"⚠️ {current_date.strftime('%d.%m.%Y')} - {shift_name}: "
-                             f"Toți medicii sunt indisponibili. Alocare forțată.")
+                             f"Tot personalul este indisponibil. Alocare forțată.")
                     selected_id = random.choice(self.doctor_ids)
                 else:
                     # Alege medicul cu cel mai mare scor
@@ -372,7 +461,7 @@ class SmartScheduler:
                     COL_DOC_ID: selected_id
                 })
             
-            current_date += dt.timedelta(days=1)
+            current_date += timedelta(days=1)
         
         progress_bar.empty()
         return pd.DataFrame(schedule_rows)
@@ -395,7 +484,6 @@ def show_schedule_grid(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
     
     # Formatare date în română
     try:
-        import locale
         locale.setlocale(locale.LC_TIME, 'ro_RO.UTF-8')
     except:
         pass  # Continuă cu setările implicite dacă nu e disponibil
@@ -567,12 +655,12 @@ def show_statistics(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
         # Gărzi de weekend
         weekend_shifts = df[df['is_weekend']].groupby(COL_DOC_ID).size()
         weekend_df = pd.DataFrame({
-            'Medic': [id_to_name.get(doc_id, str(doc_id)) for doc_id in weekend_shifts.index],
+            'Personal': [id_to_name.get(doc_id, str(doc_id)) for doc_id in weekend_shifts.index],
             'Weekend': weekend_shifts.values
         })
         
         st.metric("Gărzi Weekend", df['is_weekend'].sum())
-        st.bar_chart(weekend_df.set_index('Medic'))
+        st.bar_chart(weekend_df.set_index('Personal'))
     
     with col3:
         # Distribuție lunară
@@ -607,17 +695,13 @@ def main():
     # Header principal cu numele spitalului
     st.title(f"🏥 Planificare Gărzi - {hospital_name}")
     
-    # Curăță starea sesiunii dacă există valori invalide
-    if 'shift_type_selector' in st.session_state:
-        if st.session_state.shift_type_selector not in [1, 2]:
-            del st.session_state.shift_type_selector
-    
     # Încarcă datele
     try:
         doctors_df = load_data(SHEET_DOCTORS)
         schedule_df = load_data(SHEET_SCHEDULE)
         unavail_df = load_data(SHEET_UNAVAIL)
         preferences_df = load_data(SHEET_PREFERENCES)
+        exchanges_df = load_data(SHEET_EXCHANGES)
     except Exception as e:
         st.error(f"❌ Eroare la încărcarea datelor: {str(e)}")
         st.info("""
@@ -645,13 +729,13 @@ def main():
         with col1:
             start_date = st.date_input(
                 "Data început",
-                value=dt.date.today(),
+                value=date.today(),
                 format="DD.MM.YYYY"
             )
         with col2:
             end_date = st.date_input(
                 "Data sfârșit",
-                value=dt.date.today() + dt.timedelta(days=30),
+                value=date.today() + timedelta(days=30),
                 format="DD.MM.YYYY"
             )
         
@@ -689,6 +773,12 @@ def main():
             st.error("❌ Eroare la afișarea tipurilor de ture. Folosind valori implicite.")
             st.info(f"**Ture selectate:** {', '.join(SHIFT_TYPES[1])}")  # Afișează gărzi 24h ca fallback
         
+        # Seed pentru reproducibilitate
+        if st.checkbox("🎲 Rezultate reproductibile", help="Folosește un seed fix pentru generare"):
+            seed = st.number_input("Seed", min_value=0, value=42, step=1)
+            random.seed(seed)
+            np.random.seed(seed)
+        
         # Buton generare
         st.markdown("---")
         if st.button(
@@ -718,7 +808,7 @@ def main():
             total_shifts = len(schedule_df)
             unique_docs = schedule_df[COL_DOC_ID].nunique()
             st.metric("Total Gărzi", total_shifts)
-            st.metric("Medici Activi", unique_docs)
+            st.metric("Personal Activ", unique_docs)
     
     # Tabs principale
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -750,6 +840,7 @@ def main():
             
             # Opțiuni export
             st.markdown("---")
+            col1, col2 = st.columns(2)
             with col1:
                 # Opțiuni export îmbunătățite
                 export_format = st.selectbox(
@@ -791,7 +882,7 @@ def main():
                         st.download_button(
                             "📥 Descarcă Excel",
                             output,
-                            f"program_garzi_{dt.date.today()}.xlsx",
+                            f"program_garzi_{date.today()}.xlsx",
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
@@ -803,17 +894,17 @@ def main():
                     # Pregătește export text formatat
                     text_content = "PROGRAM GĂRZI MEDICALE\n"
                     text_content += "=" * 50 + "\n\n"
-                    text_content += f"Generat la: {dt.datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                    text_content += f"Generat la: {dt.now().strftime('%d.%m.%Y %H:%M')}\n"
                     text_content += f"Perioada: {schedule_df[COL_DATE].min()} - {schedule_df[COL_DATE].max()}\n\n"
                     
                     # Grupează pe zile
-                    for date in sorted(schedule_df[COL_DATE].unique()):
-                        date_obj = pd.to_datetime(date)
+                    for date_str in sorted(schedule_df[COL_DATE].unique()):
+                        date_obj = pd.to_datetime(date_str)
                         weekday = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică'][date_obj.weekday()]
                         text_content += f"\n{weekday}, {date_obj.strftime('%d.%m.%Y')}\n"
                         text_content += "-" * 30 + "\n"
                         
-                        day_shifts = schedule_df[schedule_df[COL_DATE] == date]
+                        day_shifts = schedule_df[schedule_df[COL_DATE] == date_str]
                         for _, shift in day_shifts.iterrows():
                             doc_name = doctors_df[doctors_df[COL_ID] == shift[COL_DOC_ID]][COL_NAME].iloc[0]
                             text_content += f"  {shift[COL_SHIFT]}: {doc_name}\n"
@@ -829,7 +920,7 @@ def main():
                     st.download_button(
                         "📥 Descarcă Document Text",
                         text_content,
-                        f"program_garzi_{dt.date.today()}.txt",
+                        f"program_garzi_{date.today()}.txt",
                         "text/plain",
                         use_container_width=True
                     )
@@ -844,7 +935,7 @@ def main():
         column_config = {
             COL_ID: st.column_config.NumberColumn(
                 "ID",
-                help="ID unic pentru fiecare medic",
+                help="ID unic pentru fiecare membru",
                 min_value=1,
                 required=True
             ),
@@ -890,7 +981,7 @@ def main():
                         st.error("❌ Există ID-uri duplicate!")
                     else:
                         save_data(SHEET_DOCTORS, edited_doctors)
-                        st.success("✅ Lista medicilor actualizată!")
+                        st.success("✅ Lista personalului actualizată!")
                         st.rerun()
                 except Exception as e:
                     st.error(f"❌ Eroare la salvare: {str(e)}")
@@ -969,7 +1060,7 @@ def main():
             
             if not doctors_df.empty:
                 pref_doc = st.selectbox(
-                    "Medic",
+                    "Personal",
                     options=doctors_df[COL_ID].tolist(),
                     format_func=lambda x: doctors_df[doctors_df[COL_ID] == x][COL_NAME].iloc[0]
                 )
@@ -1024,12 +1115,6 @@ def main():
         st.header("🔄 Sistem de Schimburi")
         st.info("💡 Permite personalului să schimbe gărzi între ei. Schimburile sunt validate automat.")
         
-        # Încarcă datele de schimburi
-        try:
-            exchanges_df = load_data(SHEET_EXCHANGES)
-        except:
-            exchanges_df = pd.DataFrame()
-        
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -1037,7 +1122,7 @@ def main():
             
             if not schedule_df.empty and not doctors_df.empty:
                 # Pregătește opțiunile pentru schimb
-                future_schedule = schedule_df[pd.to_datetime(schedule_df[COL_DATE]) >= dt.date.today()]
+                future_schedule = schedule_df[pd.to_datetime(schedule_df[COL_DATE]) >= date.today()]
                 
                 if not future_schedule.empty:
                     # Selectează cine vrea să schimbe
@@ -1085,7 +1170,7 @@ def main():
                                 COL_EX_DATE: selected_shift[COL_DATE],
                                 COL_EX_SHIFT: selected_shift[COL_SHIFT],
                                 COL_EX_STATUS: "Aprobat",  # Validare automată
-                                COL_EX_REQUESTED: dt.datetime.now().isoformat()
+                                COL_EX_REQUESTED: dt.now().isoformat()
                             }])
                             
                             # Actualizează programul
