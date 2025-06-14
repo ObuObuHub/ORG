@@ -55,11 +55,10 @@ COL_PREF_DOC = "doctor_id"
 COL_PREF_DAY = "preferred_day"  # 0=Luni, 6=Duminică
 COL_PREF_SHIFT = "preferred_shift"
 
-# Tipuri de ture
+# Tipuri de ture - doar 12h și 24h pentru acoperire continuă
 SHIFT_TYPES = {
     1: ["Gardă 24h"],
-    2: ["Gardă Zi (08-20)", "Gardă Noapte (20-08)"],
-    3: ["Tură 1 (08-16)", "Tură 2 (16-24)", "Tură 3 (00-08)"],
+    2: ["Gardă Zi 12h (08-20)", "Gardă Noapte 12h (20-08)"],
 }
 
 # ---------------------------------------------------------------------------
@@ -379,7 +378,7 @@ class SmartScheduler:
 # Funcții de vizualizare
 # ---------------------------------------------------------------------------
 def show_schedule_grid(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
-    """Afișează programul în format tabel."""
+    """Afișează programul în format tabel cu stil îmbunătățit pentru vizibilitate."""
     if schedule_df.empty:
         st.info("📅 Nu există încă un program generat.")
         return
@@ -389,54 +388,150 @@ def show_schedule_grid(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
     
     # Pregătește datele pentru pivot
     df = schedule_df.copy()
-    df['doctor_name'] = df[COL_DOC_ID].map(id_to_name).fillna("Necunoscut")
-    df['date_formatted'] = pd.to_datetime(df[COL_DATE]).dt.strftime('%d.%m')
+    df['personal_name'] = df[COL_DOC_ID].map(id_to_name).fillna("Necunoscut")
+    
+    # Formatare date în română
+    try:
+        import locale
+        locale.setlocale(locale.LC_TIME, 'ro_RO.UTF-8')
+    except:
+        pass  # Continuă cu setările implicite dacă nu e disponibil
+    
+    df['date_obj'] = pd.to_datetime(df[COL_DATE])
+    df['date_formatted'] = df['date_obj'].dt.strftime('%d.%m.%Y')
+    df['weekday'] = df['date_obj'].dt.day_name()
     
     # Creează pivot table
     pivot = df.pivot_table(
         index='date_formatted',
         columns=COL_SHIFT,
-        values='doctor_name',
+        values='personal_name',
         aggfunc='first'
     )
     
-    # Stilizare
+    # Adaugă ziua săptămânii în index
+    dates_with_weekday = []
+    for date_str in pivot.index:
+        date_obj = pd.to_datetime(date_str, format='%d.%m.%Y')
+        weekday = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică'][date_obj.weekday()]
+        dates_with_weekday.append(f"{weekday}, {date_str}")
+    pivot.index = dates_with_weekday
+    
+    # Stilizare profesională cu contrast ridicat
+    def style_cells(val):
+        if pd.isna(val):
+            return 'background-color: #f8f9fa; color: #6c757d;'
+        else:
+            # Culori diferite pentru tipuri de gărzi
+            if '24h' in str(val):
+                return 'background-color: #dc3545; color: white; font-weight: bold;'
+            elif 'Zi' in str(val):
+                return 'background-color: #28a745; color: white; font-weight: bold;'
+            elif 'Noapte' in str(val):
+                return 'background-color: #007bff; color: white; font-weight: bold;'
+            else:
+                return 'background-color: #343a40; color: white; font-weight: bold;'
+    
+    styled_pivot = pivot.style.applymap(style_cells)
+    
+    # Stilizare header
+    styled_pivot = styled_pivot.set_properties(**{
+        'text-align': 'center',
+        'font-size': '14px',
+        'border': '1px solid #dee2e6'
+    })
+    
+    # Evidențiere weekend
+    def highlight_weekend(row):
+        if any(day in row.name for day in ['Sâmbătă', 'Duminică']):
+            return ['background-color: #fff3cd; color: #856404;' for _ in row]
+        return [''] * len(row)
+    
+    styled_pivot = styled_pivot.apply(highlight_weekend, axis=1)
+    
     st.dataframe(
-        pivot.style.applymap(lambda x: 'background-color: #e8f4f8' if pd.notna(x) else ''),
+        styled_pivot,
         use_container_width=True,
         height=600
     )
 
 def show_schedule_gantt(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
-    """Afișează programul ca diagramă Gantt."""
+    """Afișează programul ca diagramă Gantt cu vizibilitate îmbunătățită."""
     if schedule_df.empty:
         return
     
     # Pregătește datele
     id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
     df = schedule_df.copy()
-    df['doctor_name'] = df[COL_DOC_ID].map(id_to_name).fillna("Necunoscut")
+    df['personal_name'] = df[COL_DOC_ID].map(id_to_name).fillna("Necunoscut")
     df['date_dt'] = pd.to_datetime(df[COL_DATE])
     df['date_end'] = df['date_dt'] + pd.Timedelta(days=1)
     
-    # Creează diagrama Gantt
-    gantt = alt.Chart(df).mark_bar(cornerRadius=5).encode(
-        y=alt.Y('doctor_name:N', title='Medic', sort=None),
-        x=alt.X('date_dt:T', title='Data'),
+    # Determină culoarea bazată pe tipul de gardă
+    def get_shift_color_mapped(shift_name):
+        if '24h' in shift_name:
+            return '#dc3545'  # Roșu pentru 24h
+        elif 'Zi' in shift_name:
+            return '#28a745'  # Verde pentru zi
+        elif 'Noapte' in shift_name:
+            return '#007bff'  # Albastru pentru noapte
+        return '#6c757d'  # Gri pentru altele
+    
+    df['color'] = df[COL_SHIFT].apply(get_shift_color_mapped)
+    
+    # Creează diagrama Gantt cu design îmbunătățit
+    gantt = alt.Chart(df).mark_bar(
+        cornerRadius=5,
+        height=25,
+        opacity=0.9
+    ).encode(
+        y=alt.Y('personal_name:N', 
+                title='Personal', 
+                sort=None,
+                axis=alt.Axis(labelFontSize=12, titleFontSize=14)),
+        x=alt.X('date_dt:T', 
+                title='Data',
+                axis=alt.Axis(
+                    format='%d.%m',
+                    labelAngle=-45,
+                    labelFontSize=11,
+                    titleFontSize=14
+                )),
         x2='date_end:T',
-        color=alt.Color(
-            COL_SHIFT + ':N',
-            title='Tip Gardă',
-            scale=alt.Scale(range=[get_shift_color(s) for s in df[COL_SHIFT].unique()])
-        ),
+        color=alt.Color('color:N', 
+                       scale=None,  # Folosim culorile predefinite
+                       legend=None),  # Ascundem legenda pentru culori
         tooltip=[
             alt.Tooltip('date_dt:T', title='Data', format='%d %B %Y'),
-            alt.Tooltip('doctor_name:N', title='Medic'),
+            alt.Tooltip('personal_name:N', title='Personal'),
             alt.Tooltip(COL_SHIFT + ':N', title='Tura'),
         ]
     ).properties(
-        height=max(400, len(df['doctor_name'].unique()) * 40)
-    ).interactive()
+        height=max(400, len(df['personal_name'].unique()) * 40),
+        title=alt.TitleParams(
+            text='Program Gărzi - Vizualizare Gantt',
+            fontSize=16,
+            font='Arial',
+            color='#333'
+        )
+    ).configure_view(
+        strokeWidth=0,
+        fill='#f8f9fa'
+    ).configure_axis(
+        grid=True,
+        gridColor='#dee2e6',
+        gridOpacity=0.5
+    )
+    
+    # Adaugă legendă manuală pentru tipurile de gărzi
+    st.markdown("""
+    <div style='margin-bottom: 20px; padding: 10px; background-color: #f8f9fa; border-radius: 5px;'>
+        <strong>Legendă:</strong>
+        <span style='background-color: #dc3545; color: white; padding: 2px 8px; margin: 0 5px; border-radius: 3px;'>Gardă 24h</span>
+        <span style='background-color: #28a745; color: white; padding: 2px 8px; margin: 0 5px; border-radius: 3px;'>Gardă Zi 12h</span>
+        <span style='background-color: #007bff; color: white; padding: 2px 8px; margin: 0 5px; border-radius: 3px;'>Gardă Noapte 12h</span>
+    </div>
+    """, unsafe_allow_html=True)
     
     st.altair_chart(gantt, use_container_width=True)
 
@@ -458,7 +553,7 @@ def show_statistics(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        # Total gărzi per medic
+        # Total gărzi per membru personal
         shifts_per_doc = df.groupby(COL_DOC_ID).size().reset_index(name='total_shifts')
         shifts_per_doc['name'] = shifts_per_doc[COL_DOC_ID].map(id_to_name)
         
@@ -489,15 +584,14 @@ def show_statistics(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 def main():
     st.set_page_config(
-        page_title="🩺 Planificator Gărzi Medicale",
+        page_title="🩺 Planificare Gărzi",
         page_icon="🏥",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
     # Header principal
-    st.title("🏥 Sistem de Planificare Gărzi Medicale")
-    st.markdown("### Versiunea 5.0 - Mai inteligent, mai prietenos")
+    st.title("🏥 Planificare Gărzi")
     
     # Încarcă datele
     try:
@@ -519,12 +613,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ Configurare Program")
         
-        # Verifică dacă există medici
+        # Verifică dacă există personal
         if doctors_df.empty:
-            st.warning("⚠️ Nu există medici înregistrați!")
-            st.info("Adaugă medici în tab-ul 'Gestionare Medici'")
+            st.warning("⚠️ Nu există personal înregistrat!")
+            st.info("Adaugă personal în tab-ul 'Gestionare Personal'")
         else:
-            st.success(f"✅ {len(doctors_df)} medici disponibili")
+            st.success(f"✅ {len(doctors_df)} membri personal disponibili")
         
         # Perioada
         st.subheader("📅 Perioada")
@@ -595,7 +689,7 @@ def main():
     # Tabs principale
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📅 **Vizualizare Program**",
-        "👨‍⚕️ **Gestionare Medici**",
+        "👨‍⚕️ **Gestionare Personal**",
         "🚫 **Indisponibilități**",
         "⭐ **Preferințe**",
         "📊 **Statistici**"
@@ -635,8 +729,8 @@ def main():
     with tab2:
         st.header("👨‍⚕️ Gestionare Personal Medical")
         
-        # Editor medici
-        st.subheader("Lista Medicilor")
+        # Editor personal
+        st.subheader("Lista Personalului")
         
         # Configurare coloane pentru editor
         column_config = {
@@ -695,7 +789,7 @@ def main():
     
     with tab3:
         st.header("🚫 Gestionare Indisponibilități")
-        st.info("💡 Marchează zilele în care medicii nu pot fi programați (concedii, congrese, etc.)")
+        st.info("💡 Marchează zilele în care personalul nu poate fi programat (concedii, congrese, etc.)")
         
         # Adaugă indisponibilitate nouă
         with st.expander("➕ Adaugă Indisponibilitate Nouă", expanded=True):
@@ -707,10 +801,10 @@ def main():
                         doctors_df[COL_NAME] + " (ID: " + doctors_df[COL_ID].astype(str) + ")",
                         doctors_df[COL_ID]
                     ))
-                    selected_doc_name = st.selectbox("Medic", options=list(doc_options.keys()))
+                    selected_doc_name = st.selectbox("Personal", options=list(doc_options.keys()))
                     selected_doc_id = doc_options[selected_doc_name]
                 else:
-                    st.warning("Nu există medici înregistrați")
+                    st.warning("Nu există personal înregistrat")
                     selected_doc_id = None
             
             with col2:
@@ -734,10 +828,10 @@ def main():
         if not unavail_df.empty:
             st.subheader("Indisponibilități Curente")
             
-            # Îmbogățește cu nume medici
+            # Îmbogățește cu nume personal
             display_df = unavail_df.copy()
             id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
-            display_df['Medic'] = display_df[COL_UNAV_DOC].map(id_to_name)
+            display_df['Personal'] = display_df[COL_UNAV_DOC].map(id_to_name)
             display_df['Data'] = pd.to_datetime(display_df[COL_UNAV_DATE]).dt.strftime('%d.%m.%Y')
             
             # Afișare și opțiune ștergere
