@@ -33,7 +33,28 @@ import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 import gspread
-from gspread_formatting import (  # type: ignore
+# Optional formatting helpers – degrade gracefully if gspread-formatting is missing
+try:
+    from gspread_formatting import (  # type: ignore
+        CellFormat, Color, set_frozen, conditional_format, BooleanRule
+    )
+    _FMT_AVAILABLE = True
+except ImportError:
+    _FMT_AVAILABLE = False
+
+    # define no‑op fallbacks
+    def set_frozen(ws, rows=1, cols=0):
+        return None
+
+    def conditional_format(*args, **kwargs):
+        return None
+
+    class Color:  # simple stub for type hints
+        def __init__(self, r=1, g=1, b=1):
+            pass
+
+    class BooleanRule:  # stub
+        pass
     CellFormat, Color, format_cell_range, set_frozen, TextFormat, conditional_format, BooleanRule, GradientRule
 )
 
