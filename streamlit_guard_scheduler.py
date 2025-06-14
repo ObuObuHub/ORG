@@ -1,19 +1,19 @@
 """streamlit_guard_scheduler.py
 
-Aplicație Streamlit pentru a gestiona programul de gărzi (on‑call) într-o foaie
+Aplicație Streamlit pentru a gestiona programul de gărzi (on‑call) într‑o foaie
 Google și a oferi vizualizări Grid & Gantt. Include editor interactiv pentru
 medici și suport pentru zile de indisponibilitate.
 
-2025-06-14 v3.5 (Versiune Finală)
+2025-06-14 v3.6 (SyntaxError Fix)
 ────────────────
+• FIX CRITIC: Corectată o eroare de sintaxă în definirea claselor dummy pentru
+  cazul în care `gspread-formatting` lipsește.
 • ROBUSTEȚE: Curățare agresivă a datelor la încărcare pentru a preveni erorile
   în st.data_editor cauzate de celule goale în Google Sheets.
 • UI/UX: Mesaje de notificare mai clare, configurare detaliată a coloanelor
   în editor și o structură a interfeței bazată pe tab-uri.
 • SIGURANȚĂ: Folosire .compare() pentru detecție sigură a modificărilor și
   cast explicit la 'Int64' pentru a preveni erorile de tip float.
-• OPTIMIZARE: Limitarea avertismentelor (st.warning) la o singură notificare
-  pe zi în cazul în care toți medicii sunt blocați.
 """
 from __future__ import annotations
 
@@ -60,11 +60,24 @@ try:
     _FMT_AVAILABLE = True
 except ImportError:
     _FMT_AVAILABLE = False
-    # Definirea unor funcții "dummy" pentru a nu crăpa codul
-    def set_frozen(ws, rows=1, cols=0): return None
-    def conditional_format(*args, **kwargs): return None
-    class Color: def __init__(self, r=1, g=1, b=1): pass
-    class BooleanRule: pass
+    
+    # FIX: Definirea corectă, pe mai multe linii, a funcțiilor și claselor "dummy"
+    def set_frozen(ws, rows=1, cols=0) -> None:
+        """Dummy function for set_frozen."""
+        pass
+
+    def conditional_format(*args, **kwargs) -> None:
+        """Dummy function for conditional_format."""
+        pass
+
+    class Color:
+        """Dummy class for gspread_formatting.Color."""
+        def __init__(self, r: float = 1, g: float = 1, b: float = 1) -> None:
+            pass
+
+    class BooleanRule:
+        """Dummy class for gspread_formatting.BooleanRule."""
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +265,7 @@ def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame) -> None:
 def main() -> None:
     """Funcția principală care rulează interfața Streamlit."""
     st.set_page_config(page_title="Orar Gărzi", layout="wide", initial_sidebar_state="expanded")
-    st.title("🩺 Organizator de Gărzi v3.5")
+    st.title("🩺 Organizator de Gărzi v3.6")
 
     try:
         doctors_df_orig = load_df(SHEET_DOCTORS)
