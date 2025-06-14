@@ -591,8 +591,9 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Selectează spitalul înainte de orice altceva
+    # Selectează spitalul PRIMUL lucru și salvează sheet_id
     sheet_id = select_hospital()
+    st.session_state["sheet_id"] = sheet_id  # CRUCIAL: salvăm în session_state
     
     # Obține numele spitalului pentru afișare
     hospitals = get_hospital_config()
