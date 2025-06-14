@@ -1,12 +1,12 @@
 """streamlit_guard_scheduler.py
-Streamlit app for managing hospital on‑call (garda) rosters using Google Sheets
-and visualising the result direct în aplicația Streamlit.
+Streamlit app for managing hospital on‑call (garda) rosters via Google Sheets
+and visualising the schedule in Streamlit.
 
-2025‑06‑14 v2.1
-──────────────
-• Fix: optional import gspread‑formatting — fără erori dacă lipsește.
-• Fix: stray parenthesis removed (SyntaxError solved).
-• Still auto‑creates/freeze headers + stripes if biblioteca există.
+2025‑06‑14 v2.2
+────────────────
+• FIX syntax – removed extra parenthesis & bad indentation → no more SyntaxError.
+• Refactored `show_schedule()` for clarity.
+• Rest of the behaviour unchanged (auto‑create sheets, optional formatting gracefully handled).
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from typing import List, Dict
 import altair as alt
 import pandas as pd
 import streamlit as st
-
 from google.oauth2.service_account import Credentials
 import gspread
 from gspread.utils import rowcol_to_a1
@@ -34,7 +33,6 @@ try:
     )
     _FMT_AVAILABLE = True
 except ImportError:  # library absent – define NO‑OP stubs
-
     _FMT_AVAILABLE = False
 
     def set_frozen(ws, rows=1, cols=0):  # type: ignore
@@ -66,32 +64,30 @@ def get_gsheet_client():
 
 
 def ensure_worksheet(sh, title: str, headers: List[str], rows: int = 200, cols: int = 20):
-    """Ensure a worksheet exists with given headers and basic formatting."""
+    """Ensure a worksheet exists with the given headers and basic formatting."""
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
-    # add headers if first row is empty
     if not any(ws.row_values(1)):
         ws.update([headers])
 
-    # apply formatting only if library available
     if _FMT_AVAILABLE:
         set_frozen(ws, rows=1)
-        first_col_letter = rowcol_to_a1(1, 1)[0]
-        last_col_letter = rowcol_to_a1(1, len(headers))[0]
-        data_range = f"{first_col_letter}2:{last_col_letter}{rows}"
+        first_col = rowcol_to_a1(1, 1)[0]
+        last_col = rowcol_to_a1(1, len(headers))[0]
+        rng = f"{first_col}2:{last_col}{rows}"
         conditional_format(
             ws,
-            data_range,
+            rng,
             BooleanRule(
                 condition={
-                    'type': 'CUSTOM_FORMULA',
-                    'values': [{'userEnteredValue': '=ISEVEN(ROW())'}]
+                    "type": "CUSTOM_FORMULA",
+                    "values": [{"userEnteredValue": "=ISEVEN(ROW())"}],
                 },
-                format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95))
-            )
+                format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95)),
+            ),
         )
     return ws
 
@@ -134,11 +130,13 @@ def generate_round_robin(doctors: List[int], start: dt.date, end: dt.date, shift
     for n in range(num_days):
         cur_date = start + dt.timedelta(days=n)
         for s in range(shifts_per_day):
-            rows.append({
-                "date": cur_date.isoformat(),
-                "shift_name": f"Shift {s+1}",
-                "doctor_id": doctor_cycle[idx]
-            })
+            rows.append(
+                {
+                    "date": cur_date.isoformat(),
+                    "shift_name": f"Shift {s+1}",
+                    "doctor_id": doctor_cycle[idx],
+                }
+            )
             idx += 1
     return pd.DataFrame(rows)
 
@@ -147,39 +145,41 @@ def generate_round_robin(doctors: List[int], start: dt.date, end: dt.date, shift
 # ──────────────────────────────────────────────────────────
 
 def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
+    """Display table + heat‑map for the current schedule."""
+    # Map ID→Name
     id2name = doctors_df.set_index("id")["name"].to_dict()
-    schedule_df = schedule_df.copy()
-    schedule_df["doctor_name"] = schedule_df["doctor_id"].map(id2name)
+    df = schedule_df.copy()
+    df["doctor_name"] = df["doctor_id"].map(id2name)
 
-    # Pivot for tabular calendar view
-    pivot = schedule_df.pivot(index="date", columns="shift_name", values="doctor_name")
+    # Pivot table
     st.subheader("📅 Calendar (pivot)")
+    pivot = df.pivot(index="date", columns="shift_name", values="doctor_name")
     st.dataframe(pivot, use_container_width=True)
 
-        # Altair heatmap (grid‑style)
+    # Heat‑map grid
     st.subheader("🖼️ Vizualizare grafică")
-    schedule_df["date_str"] = pd.to_datetime(schedule_df["date"]).dt.strftime("%Y-%m-%d")
+    df["date_str"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     chart = (
-        alt.Chart(schedule_df)
+        alt.Chart(df)
         .mark_rect()
         .encode(
             x=alt.X("date_str:O", title="Data", axis=alt.Axis(labelAngle=-45)),
             y=alt.Y("doctor_name:N", title="Medic"),
             color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
-            tooltip=["date_str", "doctor_name", "shift_name"]
+            tooltip=["date_str", "doctor_name", "shift_name"],
         )
-        .properties(width='container', height=500)
+        .properties(width="container", height=500)
     )
-    st.altair_chart(chart, use_container_width=True(chart, use_container_width=True)
+    st.altair_chart(chart, use_container_width=True)
 
 # ──────────────────────────────────────────────────────────
 # Main Streamlit app
 # ──────────────────────────────────────────────────────────
 
 def main():
-    st.title("🩺 Organizator de Gărzi – v2.1")
+    st.title("🩺 Organizator de Gărzi – v2.2")
 
-    # Sidebar
+    # Sidebar controls
     with st.sidebar:
         st.header("📅 Interval")
         today = dt.date.today()
@@ -188,7 +188,7 @@ def main():
         shifts_per_day = st.number_input("Gărzi/zi", 1, 4, 1)
         st.markdown("---")
 
-    # Load sheets
+    # Load data
     doctors_df = load_sheet("Doctors")
     schedule_df = load_sheet("Schedule")
 
@@ -202,14 +202,16 @@ def main():
     # Generate schedule
     if st.button("Generează orar", type="primary"):
         try:
-            new_df = generate_round_robin(doctors_df["id"].tolist(), start_date, end_date, shifts_per_day)
+            new_df = generate_round_robin(
+                doctors_df["id"].tolist(), start_date, end_date, shifts_per_day
+            )
             write_schedule(new_df)
-            schedule_df = new_df  # refresh
-            st.success("Orar salvat în Google Sheets și afișat mai jos!")
+            schedule_df = new_df  # refresh local copy
+            st.success("Orar salvat și afișat mai jos!")
         except Exception as e:
             st.error(str(e))
 
-    # Show schedule
+    # Display schedule
     if not schedule_df.empty:
         show_schedule(schedule_df, doctors_df)
     else:
