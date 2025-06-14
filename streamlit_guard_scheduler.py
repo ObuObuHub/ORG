@@ -1,6 +1,6 @@
 if st.sidebar.checkbox("🎲 Folosește seed fix", help="Pentru rezultate reproductibile"):
                     seed = st.sidebar.number_input("Seed", min_value=0, value=42)
-                    random.seed(seed)"""streamlit_guard_scheduler.py
+                    random.seed(seed)
 
 Aplicație Streamlit pentru gestionarea programului de gărzi medicale.
 Versiune îmbunătățită cu algoritm mai inteligent și interfață mai prietenoasă.
