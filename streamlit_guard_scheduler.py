@@ -1,61 +1,50 @@
 """streamlit_guard_scheduler.py
-Streamlit app for managing hospital on‑call (garda) rosters powered by Google Sheets.
+Streamlit app for managing hospital on-call (garda) rosters powered by Google Sheets.
+
+CHANGELOG (2025‑06‑14)
+----------------------
+• Added ALT‑air heat‑map & pivot‑table visualisations so the schedule is visible in the app.
+• Added automatic creation of the required Google‑Sheets worksheets with frozen header & basic colour‑banding for clarity.
+• Added error guards when doctor list is empty.
+• Added requirements comment (`altair`, `gspread-formatting`).
 
 Prerequisites
 -------------
-1. Create a Google Cloud project and service‑account with access to the target spreadsheet.
-2. In Streamlit Cloud (or locally), add the service‑account JSON *as secrets*:
-   [gcp_service_account]
-   type = "service_account"
-   project_id = "..."
-   private_key_id = "..."
-   private_key = "-----BEGIN PRIVATE KEY-----\\n..."
-   client_email = "..."
-   client_id = "..."
-   ...
-3. Also add the spreadsheet ID to *secrets*:
-   sheet_id = "YOUR_SHEET_ID"
-4. Required Python packages (add to requirements.txt):
-   streamlit
-   pandas
-   gspread
-   google-auth
+1. Service‑account & `secrets.toml` as before (see previous instructions).
+2. **Install extra packages**: add to `requirements.txt`:
+   ````
+   altair==5.3
+   gspread-formatting==1.1.2
+   ````
 
-Google Sheets layout
+Google Sheets layout
 --------------------
-The spreadsheet should contain (at minimum) two tabs:
-
-1. `Doctors`
-   | id | name        | speciality | max_shifts_per_month |
-   |----|-------------|------------|----------------------|
-   | 1  | Dr. Popescu | Hematology | 6                    |
-
-2. `Schedule`
-   | date       | shift_name | doctor_id |
-   |------------|------------|-----------|
-   | 2025-07-01 | Night      | 1         |
-
-Feel free to add more sheets (Preferences, Holidays, etc.).
+Still two tabs (`Doctors`, `Schedule`).  If the tab is missing, the app now
+creates it with headers and applies conditional formatting (striped rows).
 
 """
-
 from __future__ import annotations
 
 import datetime as dt
-from typing import List
+from typing import List, Dict
 
+import altair as alt  # NEW
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 import gspread
+from gspread_formatting import (  # type: ignore
+    CellFormat, Color, format_cell_range, set_frozen, TextFormat, conditional_format, BooleanRule, GradientRule
+)
 
-
-@st.cache_resource
+# ────────────────────────────────────────────────────────────────────────────────
+# Google‑Sheets helpers
+# ────────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
 def get_gsheet_client():
-    """Authorize and return a gspread client using Streamlit secrets."""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=scope
@@ -63,98 +52,143 @@ def get_gsheet_client():
     return gspread.authorize(creds)
 
 
+def ensure_worksheet(sh, title: str, headers: List[str], rows: int = 200, cols: int = 20):
+    """Ensure worksheet exists & has headers; apply simple formatting."""
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+    # add headers if first row empty
+    if not any(ws.row_values(1)):
+        ws.update([headers])
+    # freeze header
+    set_frozen(ws, rows=1)
+    # striped rows conditional formatting for readability
+    first_col_letter = gspread.utils.rowcol_to_a1(1, 1)[0]
+    last_col_letter = gspread.utils.rowcol_to_a1(1, len(headers))[0]
+    range_a1 = f"{first_col_letter}2:{last_col_letter}{rows}"
+    conditional_format(
+        ws, range_a1,
+        BooleanRule(
+            condition={'type': 'CUSTOM_FORMULA', 'values': [{'userEnteredValue': '=ISEVEN(ROW())'}]},
+            format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95))
+        )
+    )
+    return ws
+
+
 @st.cache_data(ttl=300)
 def load_sheet(sheet_name: str) -> pd.DataFrame:
-    """Load a Google Sheet tab into a DataFrame."""
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
-    worksheet = sh.worksheet(sheet_name)
-    df = pd.DataFrame(worksheet.get_all_records())
+    # auto‑create sheets with headers if missing
+    if sheet_name == "Doctors":
+        ws = ensure_worksheet(sh, "Doctors", ["id", "name", "speciality", "max_shifts_per_month"])
+    else:
+        ws = ensure_worksheet(sh, "Schedule", ["date", "shift_name", "doctor_id"])
+    df = pd.DataFrame(ws.get_all_records())
     return df
 
 
 def write_schedule(df: pd.DataFrame):
-    """Write the schedule DataFrame back to the Schedule sheet, replacing contents."""
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
-    worksheet = sh.worksheet("Schedule")
-    # Clear existing rows and update
-    worksheet.clear()
-    worksheet.update([df.columns.values.tolist()] + df.values.tolist())
+    ws = ensure_worksheet(sh, "Schedule", ["date", "shift_name", "doctor_id"])
+    ws.clear()
+    ws.update([df.columns.values.tolist()] + df.values.tolist())
+    set_frozen(ws, rows=1)
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Simple round‑robin scheduler
+# ────────────────────────────────────────────────────────────────────────────────
 
-def generate_round_robin(
-    doctors: List[int], start_date: dt.date, end_date: dt.date, shifts_per_day: int = 1
-) -> pd.DataFrame:
-    """Simple round‑robin scheduler.
-
-    Args:
-        doctors: list of doctor_id
-        start_date: first day inclusive
-        end_date: last day inclusive
-        shifts_per_day: number of identical shifts per day (e.g., 1 = full 24h garda)
-    Returns:
-        DataFrame with columns date, shift_name, doctor_id
-    """
-    schedule_rows = []
-    total_days = (end_date - start_date).days + 1
-    doctor_cycle = doctors * ((total_days * shifts_per_day) // len(doctors) + 1)
+def generate_round_robin(doctors: List[int], start: dt.date, end: dt.date, shifts_per_day: int = 1) -> pd.DataFrame:
+    if not doctors:
+        raise ValueError("Lista medicilor este goală – adaugă cel puțin un medic.")
+    days = (end - start).days + 1
+    doctor_cycle = doctors * ((days * shifts_per_day) // len(doctors) + 1)
+    rows: List[Dict] = []
     idx = 0
-    for n in range(total_days):
-        day = start_date + dt.timedelta(days=n)
-        for spd in range(shifts_per_day):
-            schedule_rows.append(
-                {
-                    "date": day.isoformat(),
-                    "shift_name": f"Shift {spd+1}",
-                    "doctor_id": doctor_cycle[idx],
-                }
-            )
+    for n in range(days):
+        d = start + dt.timedelta(days=n)
+        for s in range(shifts_per_day):
+            rows.append({"date": d.isoformat(), "shift_name": f"Shift {s+1}", "doctor_id": doctor_cycle[idx]})
             idx += 1
-    return pd.DataFrame(schedule_rows)
+    return pd.DataFrame(rows)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ────────────────────────────────────────────────────────────────────────────────
+
+def show_schedule_table(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
+    """Pivot schedule into calendar‑style table and render altair heatmap."""
+    # Map id → name
+    id2name = doctors_df.set_index("id")["name"].to_dict()
+    schedule_df["doctor_name"] = schedule_df["doctor_id"].map(id2name)
+
+    # Wide pivot table (date × shift)
+    pivot = schedule_df.pivot(index="date", columns="shift_name", values="doctor_name")
+    st.subheader("📅 Calendar (pivot table)")
+    st.dataframe(pivot, use_container_width=True)
+
+    # Altair heatmap
+    st.subheader("🖼️ Vizualizare grafică")
+    try:
+        schedule_df["date"] = pd.to_datetime(schedule_df["date"])
+        chart = (
+            alt.Chart(schedule_df)
+            .mark_rect()
+            .encode(
+                x=alt.X("date:T", title="Data", axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("doctor_name:N", title="Medic"),
+                color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
+                tooltip=["date:T", "doctor_name", "shift_name"]
+            )
+            .properties(width="container", height=400)
+        )
+        st.altair_chart(chart, use_container_width=True)
+    except Exception as e:
+        st.warning(f"Nu am putut desena graficul Altair: {e}")
 
 
 def main():
-    st.title("🩺 Organizator de Gărzi")
+    st.title("🩺 Organizator de Gărzi – v2")
 
-    st.sidebar.header("📅 Interval de programare")
-    today = dt.date.today()
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
+    # ─ Sidebar inputs
+    with st.sidebar:
+        st.header("📅 Interval")
+        today = dt.date.today()
         start_date = st.date_input("Început", today)
-    with col2:
         end_date = st.date_input("Sfârșit", today + dt.timedelta(days=30))
+        shifts_per_day = st.number_input("Gărzi/zi", 1, 4, 1)
+        st.markdown("---")
 
-    st.sidebar.markdown("---")
-    shifts_per_day = st.sidebar.number_input(
-        "Gărzi/zi", min_value=1, max_value=5, value=1
-    )
-
-    # Load data
+    # ─ Load data
     doctors_df = load_sheet("Doctors")
-
-    st.subheader("👩‍⚕️ Lista Medicilor")
-    st.dataframe(doctors_df, use_container_width=True)
-
-    doctor_ids = doctors_df["id"].tolist()
-
-    if start_date > end_date:
-        st.error("Data de început trebuie să fie înainte de data de sfârșit.")
-        st.stop()
-
-    if st.button("Generează orar", type="primary"):
-        schedule_df = generate_round_robin(
-            doctor_ids, start_date, end_date, shifts_per_day
-        )
-        write_schedule(schedule_df)
-        st.success("Orarul a fost salvat în Google Sheets! 🚀")
-
-    st.subheader("📊 Orar curent (din Google Sheets)")
     schedule_df = load_sheet("Schedule")
-    if not schedule_df.empty:
-        st.dataframe(schedule_df, use_container_width=True)
+
+    # display doctors
+    st.subheader("👩‍⚕️ Medici")
+    if doctors_df.empty:
+        st.error("Lista medicilor e goală – adaugă în tab-ul 'Doctors' din Google Sheets.")
     else:
-        st.info("Nu există încă un orar salvat. Folosește butonul de mai sus.")
+        st.dataframe(doctors_df, use_container_width=True)
+
+    # generate schedule button
+    if st.button("Generează orar", type="primary"):
+        try:
+            new_df = generate_round_robin(doctors_df["id"].tolist(), start_date, end_date, shifts_per_day)
+            write_schedule(new_df)
+            st.success("Orar salvat în Google Sheets!")
+            schedule_df = new_df  # refresh local copy
+        except Exception as e:
+            st.error(str(e))
+
+    # ─ Display schedule
+    if schedule_df.empty:
+        st.info("Încă nu există orar salvat.")
+    else:
+        show_schedule_table(schedule_df, doctors_df)
 
 
 if __name__ == "__main__":
