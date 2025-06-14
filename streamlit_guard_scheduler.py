@@ -4,13 +4,15 @@ Streamlit app – gestionează programul de gărzi (on‑call) într‑o foaie G
 oferă vizualizări Grid & Gantt. Include editor interactiv pentru medici și suport
 pentru indisponibilități.
 
-2025-06-15 v3.3 (Final)
+2025-06-15 v3.4 (Robust Fix)
 ────────────────
+• FIX: Adăugat un pas de curățare agresivă în `load_df` pentru a elimina rândurile
+  cu ID-uri goale înainte de conversia tipurilor de date, prevenind erorile
+  în `st.data_editor`.
 • FIX: Type hints complete pentru toate funcțiile.
-• FIX: Robustețe la citirea ID-urilor din Sheets (cast la Int64 pt. a preveni erori float).
-• FIX: Folosire .compare() în loc de .equals() pentru detecție sigură a modificărilor.
+• FIX: Robustețe la citirea ID-urilor din Sheets (cast la Int64).
+• FIX: Folosire .compare() pentru detecție sigură a modificărilor.
 • FIX: Limitarea avertismentelor (st.warning) la o singură notificare pe zi.
-• Toate celelalte funcționalități din v3.2 păstrate.
 """
 from __future__ import annotations
 
@@ -135,7 +137,14 @@ def load_df(sheet_name: str) -> pd.DataFrame:
     ws = ensure_ws(sh, sheet_name, headers_map[sheet_name])
     df = pd.DataFrame(ws.get_all_records()).reset_index(drop=True)
 
-    # FIX: Prevenire erori de tip (ex: 1 -> 1.0) la citirea din Sheets
+    # FIX ROBUST: Elimină rândurile goale ÎNAINTE de a converti tipurile.
+    # Un medic fără ID este invalid.
+    if COL_ID in df.columns:
+        # Înlocuiește string-urile goale cu valori nule și apoi șterge rândurile
+        df[COL_ID] = df[COL_ID].replace('', pd.NA)
+        df.dropna(subset=[COL_ID], inplace=True)
+
+    # Acum, conversia este sigură.
     if sheet_name in (SHEET_DOCTORS, SHEET_SCHEDULE, SHEET_UNAVAIL):
         id_col = COL_ID if sheet_name == SHEET_DOCTORS else COL_DOC_ID
         if id_col in df.columns:
@@ -260,7 +269,7 @@ def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Orar Gărzi", layout="wide", initial_sidebar_state="expanded")
-    st.title("🩺 Organizator de Gărzi v3.3")
+    st.title("🩺 Organizator de Gărzi v3.4")
 
     try:
         doctors_df_orig = load_df(SHEET_DOCTORS)
@@ -297,9 +306,14 @@ def main() -> None:
 
     with tab2:
         st.header("Editor Listă Medici")
-        edited_doctors = st.data_editor(doctors_df_orig, num_rows_to_add=2, use_container_width=True, key="doc_editor")
+        # Primul st.data_editor care se execută
+        edited_doctors = st.data_editor(
+            doctors_df_orig,
+            num_rows_to_add=2,
+            use_container_width=True,
+            key="doc_editor"
+        )
         
-        # FIX: Folosim .compare() pentru o detecție robustă a schimbărilor
         if not edited_doctors.compare(doctors_df_orig).empty:
             write_df(SHEET_DOCTORS, edited_doctors)
             st.success("Lista medicilor a fost salvată!")
