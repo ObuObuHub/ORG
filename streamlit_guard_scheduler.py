@@ -16,6 +16,7 @@ import datetime as dt
 from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict
 import random
+import io
 
 import altair as alt
 import pandas as pd
@@ -735,16 +736,84 @@ def main():
             
             # Opțiuni export
             st.markdown("---")
-            col1, col2 = st.columns(2)
             with col1:
-                csv = schedule_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "📥 Descarcă CSV",
-                    csv,
-                    "program_garzi.csv",
-                    "text/csv",
-                    use_container_width=True
+                # Opțiuni export îmbunătățite
+                export_format = st.selectbox(
+                    "Format export:",
+                    ["Excel (.xlsx)", "Document Text (.txt)", "CSV (.csv)"]
                 )
+                
+                if export_format == "Excel (.xlsx)":
+                    # Pregătește export Excel
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                        # Foaie principală cu programul
+                        export_df = schedule_df.copy()
+                        export_df['Nume Personal'] = export_df[COL_DOC_ID].map(
+                            dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+                        )
+                        export_df['Data'] = pd.to_datetime(export_df[COL_DATE]).dt.strftime('%d.%m.%Y')
+                        export_df[['Data', 'Nume Personal', COL_SHIFT]].to_excel(
+                            writer, sheet_name='Program Gărzi', index=False
+                        )
+                        
+                        # Foaie cu statistici
+                        stats_df = schedule_df.groupby(COL_DOC_ID).agg({
+                            COL_DATE: 'count'
+                        }).reset_index()
+                        stats_df.columns = ['ID Personal', 'Total Gărzi']
+                        stats_df['Nume'] = stats_df['ID Personal'].map(
+                            dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+                        )
+                        stats_df[['Nume', 'Total Gărzi']].to_excel(
+                            writer, sheet_name='Statistici', index=False
+                        )
+                    
+                    output.seek(0)
+                    st.download_button(
+                        "📥 Descarcă Excel",
+                        output,
+                        f"program_garzi_{dt.date.today()}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                
+                elif export_format == "Document Text (.txt)":
+                    # Pregătește export text formatat
+                    text_content = "PROGRAM GĂRZI MEDICALE\n"
+                    text_content += "=" * 50 + "\n\n"
+                    text_content += f"Generat la: {dt.datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                    text_content += f"Perioada: {schedule_df[COL_DATE].min()} - {schedule_df[COL_DATE].max()}\n\n"
+                    
+                    # Grupează pe zile
+                    for date in sorted(schedule_df[COL_DATE].unique()):
+                        date_obj = pd.to_datetime(date)
+                        weekday = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică'][date_obj.weekday()]
+                        text_content += f"\n{weekday}, {date_obj.strftime('%d.%m.%Y')}\n"
+                        text_content += "-" * 30 + "\n"
+                        
+                        day_shifts = schedule_df[schedule_df[COL_DATE] == date]
+                        for _, shift in day_shifts.iterrows():
+                            doc_name = doctors_df[doctors_df[COL_ID] == shift[COL_DOC_ID]][COL_NAME].iloc[0]
+                            text_content += f"  {shift[COL_SHIFT]}: {doc_name}\n"
+                    
+                    st.download_button(
+                        "📥 Descarcă Text",
+                        text_content,
+                        f"program_garzi_{dt.date.today()}.txt",
+                        "text/plain",
+                        use_container_width=True
+                    )
+                
+                else:  # CSV
+                    csv = schedule_df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "📥 Descarcă CSV",
+                        csv,
+                        f"program_garzi_{dt.date.today()}.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
     
     with tab2:
         st.header("👨‍⚕️ Gestionare Personal Medical")
@@ -870,8 +939,8 @@ def main():
                         st.rerun()
     
     with tab4:
-        st.header("⭐ Preferințe Medici")
-        st.info("💡 Setează preferințele medicilor pentru anumite zile sau tipuri de gărzi")
+        st.header("⭐ Preferințe Personal")
+        st.info("💡 Setează preferințele personalului pentru anumite zile sau tipuri de gărzi")
         
         # Editor preferințe
         col1, col2 = st.columns([2, 1])
@@ -908,20 +977,29 @@ def main():
                     st.success("✅ Preferință adăugată!")
                     st.rerun()
         
-        # Afișare preferințe existente
+        # Afișare preferințe existente cu opțiune ștergere
         if not preferences_df.empty:
             st.subheader("Preferințe Existente")
             display_prefs = preferences_df.copy()
             id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
-            display_prefs['Medic'] = display_prefs[COL_PREF_DOC].map(id_to_name)
+            display_prefs['Personal'] = display_prefs[COL_PREF_DOC].map(id_to_name)
             days = ["Luni", "Marți", "Miercuri", "Joi", "Vineri", "Sâmbătă", "Duminică"]
             display_prefs['Zi'] = display_prefs[COL_PREF_DAY].map(lambda x: days[x] if 0 <= x < 7 else "Invalid")
             
-            st.dataframe(
-                display_prefs[['Medic', 'Zi', COL_PREF_SHIFT]],
-                use_container_width=True,
-                hide_index=True
-            )
+            # Afișare cu butoane de ștergere
+            for idx, row in display_prefs.iterrows():
+                col1, col2, col3, col4 = st.columns([3, 2, 2, 1])
+                with col1:
+                    st.write(f"**{row['Personal']}**")
+                with col2:
+                    st.write(row['Zi'])
+                with col3:
+                    st.write(row[COL_PREF_SHIFT])
+                with col4:
+                    if st.button("🗑️", key=f"del_pref_{idx}"):
+                        preferences_df = preferences_df.drop(idx)
+                        save_data(SHEET_PREFERENCES, preferences_df)
+                        st.rerun()
     
     with tab5:
         st.header("📊 Analiză Detaliată")
