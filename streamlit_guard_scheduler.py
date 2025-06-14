@@ -145,38 +145,55 @@ def generate_round_robin(doctors: List[int], start: dt.date, end: dt.date, shift
 # ──────────────────────────────────────────────────────────
 
 def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
-    """Display table + heat‑map for the current schedule."""
-    # Map ID→Name
+    """Display schedule with either Pivot grid or Gantt-style Altair chart."""
+
+    # Map ID → Name and prep data
     id2name = doctors_df.set_index("id")["name"].to_dict()
     df = schedule_df.copy()
     df["doctor_name"] = df["doctor_id"].map(id2name)
+    df["date_dt"] = pd.to_datetime(df["date"])
+    df["date_end"] = df["date_dt"] + pd.Timedelta(days=1)
 
-    # Pivot table
-    st.subheader("📅 Calendar (pivot)")
-    pivot = df.pivot(index="date", columns="shift_name", values="doctor_name")
-    st.dataframe(pivot, use_container_width=True)
+    # Sidebar selector inside the expander for compact UI
+    with st.expander("Alege vizualizarea", expanded=True):
+        view = st.radio("Tip grafic", ["Grid", "Gantt"], horizontal=True)
 
-    # Heat‑map grid
-    st.subheader("🖼️ Vizualizare grafică")
-    df["date_str"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    chart = (
-        alt.Chart(df)
-        .mark_rect()
-        .encode(
-            x=alt.X("date_str:O", title="Data", axis=alt.Axis(labelAngle=-45)),
+    if view == "Grid":
+        # Pivot table view
+        st.subheader("📅 Calendar (pivot)")
+        pivot = df.pivot(index="date", columns="shift_name", values="doctor_name")
+        st.dataframe(pivot, use_container_width=True)
+
+        # Heat‑map grid
+        st.subheader("🖼️ Heat‑map grid")
+        df["date_str"] = df["date_dt"].dt.strftime("%Y-%m-%d")
+        chart = (
+            alt.Chart(df)
+            .mark_rect()
+            .encode(
+                x=alt.X("date_str:O", title="Data", axis=alt.Axis(labelAngle=-45)),
+                y=alt.Y("doctor_name:N", title="Medic"),
+                color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
+                tooltip=["date_str", "doctor_name", "shift_name"],
+            )
+            .properties(width="container", height=500)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    else:  # Gantt view
+        st.subheader("📊 Vizualizare Gantt")
+        base = alt.Chart(df).encode(
             y=alt.Y("doctor_name:N", title="Medic"),
             color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
-            tooltip=["date_str", "doctor_name", "shift_name"],
         )
-        .properties(width="container", height=500)
-    )
-    st.altair_chart(chart, use_container_width=True)
+        gantt = base.mark_bar().encode(
+            x=alt.X("date_dt:T", title="Început"),
+            x2=alt.X2("date_end:T", title="Sfârșit"),
+            tooltip=["doctor_name", "shift_name", alt.Tooltip("date_dt:T", title="Dată")],
+        ).properties(width="container", height=500)
+        st.altair_chart(gantt, use_container_width=True)
 
-# ──────────────────────────────────────────────────────────
-# Main Streamlit app
-# ──────────────────────────────────────────────────────────
-
-def main():
+def main()():
     st.title("🩺 Organizator de Gărzi – v2.2")
 
     # Sidebar controls
