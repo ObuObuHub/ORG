@@ -593,6 +593,11 @@ def main():
     # Header principal
     st.title("🏥 Planificare Gărzi")
     
+    # Curăță starea sesiunii dacă există valori invalide
+    if 'shift_type_selector' in st.session_state:
+        if st.session_state.shift_type_selector not in [1, 2]:
+            del st.session_state.shift_type_selector
+    
     # Încarcă datele
     try:
         doctors_df = load_data(SHEET_DOCTORS)
@@ -642,18 +647,33 @@ def main():
         
         # Tip program
         st.subheader("🕐 Tip Program")
+        
+        # Asigură-te că valoarea implicită este validă
+        default_shift_type = 1  # Valoare implicită sigură
+        
         shifts_type = st.selectbox(
             "Alege tipul de gărzi",
-            options=[1, 2, 3],
+            options=[1, 2],
             format_func=lambda x: {
                 1: "📍 O gardă de 24h",
-                2: "☀️ Zi + 🌙 Noapte",
-                3: "🌅 3 Ture de 8 ore"
-            }[x]
+                2: "☀️ Zi (12h) + 🌙 Noapte (12h)"
+            }[x],
+            index=0,  # Forțează prima opțiune ca implicit
+            key="shift_type_selector"  # Cheie unică pentru a reseta starea
         )
         
+        # Validare suplimentară pentru siguranță
+        if shifts_type not in SHIFT_TYPES:
+            st.error(f"❌ Tip de gardă invalid selectat: {shifts_type}")
+            shifts_type = 1  # Revenire la valoarea implicită
+            st.info("ℹ️ Am revenit la gărzi de 24h.")
+        
         # Afișează detalii despre ture
-        st.info(f"**Ture selectate:** {', '.join(SHIFT_TYPES[shifts_type])}")
+        try:
+            st.info(f"**Ture selectate:** {', '.join(SHIFT_TYPES[shifts_type])}")
+        except KeyError:
+            st.error("❌ Eroare la afișarea tipurilor de ture. Folosind valori implicite.")
+            st.info(f"**Ture selectate:** {', '.join(SHIFT_TYPES[1])}")  # Afișează gărzi 24h ca fallback
         
         # Buton generare
         st.markdown("---")
