@@ -4,12 +4,14 @@ Aplicație Streamlit pentru a gestiona programul de gărzi (on‑call) într‑o
 Google și a oferi vizualizări Grid & Gantt. Include editor interactiv pentru
 medici și suport pentru zile de indisponibilitate.
 
-2025-06-15 v3.7 (Final Stability Fix)
+2025-06-15 v4.1 (Definitive Fix)
 ────────────────
-• FIX CRITIC: Implementat un proces de validare și curățare în mai mulți pași
-  în `load_df` pentru a garanta că datele trimise către `st.data_editor`
-  sunt curate și nu mai cauzează erori de tip.
-• Păstrează toate îmbunătățirile de robustețe și UI din versiunile anterioare.
+• FIX DEFINITIV: Implementată o funcție de încărcare `load_and_clean_df` complet
+  refăcută, care inspectează datele înainte de a le converti. Previne eroarea
+  `TypeError` cauzată de coloane numerice complet goale în Google Sheets.
+• ROBUSTEȚE: Validare strictă a datelor la încărcare pentru a elimina rândurile
+  invalide și a standardiza tipurile de date.
+• Toate celelalte îmbunătățiri de UI și logică din versiunile anterioare sunt păstrate.
 """
 from __future__ import annotations
 
@@ -56,7 +58,6 @@ try:
     _FMT_AVAILABLE = True
 except ImportError:
     _FMT_AVAILABLE = False
-    
     def set_frozen(ws, rows=1, cols=0) -> None: pass
     def conditional_format(*args, **kwargs) -> None: pass
     class Color:
@@ -71,13 +72,9 @@ except ImportError:
 def get_gsheet_client() -> gspread.Client:
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
     )
     return gspread.authorize(creds)
-
 
 def _apply_format(ws: gspread.Worksheet, headers: List[str], rows: int = 1000) -> None:
     if not _FMT_AVAILABLE: return
@@ -85,14 +82,12 @@ def _apply_format(ws: gspread.Worksheet, headers: List[str], rows: int = 1000) -
     first_col, last_col = rowcol_to_a1(1, 1)[0], rowcol_to_a1(1, len(headers))[0]
     rng = f"{first_col}2:{last_col}{rows}"
     conditional_format(
-        ws,
-        rng,
+        ws, rng,
         BooleanRule(
             condition={"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": "=ISEVEN(ROW())"}]},
             format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95)),
         ),
     )
-
 
 def ensure_ws(sh: gspread.Spreadsheet, title: str, headers: List[str]) -> gspread.Worksheet:
     try:
@@ -104,9 +99,9 @@ def ensure_ws(sh: gspread.Spreadsheet, title: str, headers: List[str]) -> gsprea
     _apply_format(ws, headers)
     return ws
 
-
-@st.cache_data(ttl=300, show_spinner="Încărcare date din Google Sheets...")
-def load_df(sheet_name: str) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner="Încărcare și validare date...")
+def load_and_clean_df(sheet_name: str) -> pd.DataFrame:
+    """Încarcă datele, le validează și le curăță pentru a fi compatibile cu Streamlit."""
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
     headers_map = {
@@ -117,32 +112,51 @@ def load_df(sheet_name: str) -> pd.DataFrame:
     ws = ensure_ws(sh, sheet_name, headers_map[sheet_name])
     df = pd.DataFrame(ws.get_all_records()).reset_index(drop=True)
 
-    # --- Proces de curățare robustă ---
+    # Proces de curățare specific pentru fiecare foaie
     if sheet_name == SHEET_DOCTORS:
-        if COL_ID in df.columns:
-            df[COL_ID] = df[COL_ID].replace("", pd.NA)
-            df.dropna(subset=[COL_ID], inplace=True)
-            df[COL_ID] = pd.to_numeric(df[COL_ID], errors="coerce").astype("Int64")
-        if COL_MAX in df.columns:
-            df[COL_MAX] = pd.to_numeric(df[COL_MAX], errors="coerce").astype("Int64")
-    elif sheet_name == SHEET_SCHEDULE and COL_DOC_ID in df.columns:
-        df[COL_DOC_ID] = pd.to_numeric(df[COL_DOC_ID], errors="coerce").astype("Int64")
-    elif sheet_name == SHEET_UNAVAIL and COL_UNAV_DOC in df.columns:
-        df[COL_UNAV_DOC] = pd.to_numeric(df[COL_UNAV_DOC], errors="coerce").astype("Int64")
+        # 1. Asigură existența coloanelor esențiale, chiar dacă sunt goale în sheet
+        for col in headers_map[SHEET_DOCTORS]:
+            if col not in df.columns:
+                df[col] = pd.NA
+        
+        # 2. Elimină rândurile fără un ID valid, care sunt inutile
+        df[COL_ID] = df[COL_ID].replace("", pd.NA)
+        df.dropna(subset=[COL_ID], inplace=True)
+        
+        # 3. Conversii sigure de tipuri pentru coloanele de bază
+        df[COL_ID] = pd.to_numeric(df[COL_ID], errors="coerce").astype("Int64")
+        df[COL_NAME] = df[COL_NAME].astype(str)
+        df[COL_SPEC] = df[COL_SPEC].astype(str)
+        
+        # 4. CRITICAL FIX: Conversie condiționată pentru coloana numerică opțională
+        # Verifică dacă există vreo valoare numerică reală înainte de a converti.
+        if pd.to_numeric(df[COL_MAX], errors='coerce').notna().any():
+            df[COL_MAX] = pd.to_numeric(df[COL_MAX], errors='coerce').astype('Int64')
+        else:
+             # Dacă e complet goală, o creăm ca tip Int64, dar fără a forța conversia datelor inexistente.
+             df[COL_MAX] = pd.Series(pd.NA, index=df.index, dtype='Int64')
 
+    elif sheet_name in [SHEET_SCHEDULE, SHEET_UNAVAIL]:
+        id_col = COL_DOC_ID if sheet_name == SHEET_SCHEDULE else COL_UNAV_DOC
+        if id_col in df.columns:
+            df.dropna(subset=[id_col], inplace=True)
+            df[id_col] = pd.to_numeric(df[id_col], errors="coerce").astype("Int64")
+    
     return df
-
 
 def write_df(sheet_name: str, df: pd.DataFrame) -> None:
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
     headers = list(df.columns)
     ws = ensure_ws(sh, sheet_name, headers)
+    
+    # Asigurăm conversia la string înainte de a scrie pentru a evita erori de tip
+    df_str = df.astype(str).replace('<NA>', '')
+    
     ws.clear()
-    ws.update([headers] + df.fillna("").values.tolist(), value_input_option='USER_ENTERED')
+    ws.update([headers] + df_str.values.tolist(), value_input_option='USER_ENTERED')
     _apply_format(ws, headers, rows=len(df) + 10)
     st.cache_data.clear()
-
 
 # ---------------------------------------------------------------------------
 # Algoritmul de Planificare
@@ -194,7 +208,6 @@ def generate_schedule(
         
     return pd.DataFrame(rows)
 
-
 # ---------------------------------------------------------------------------
 # Componente UI
 # ---------------------------------------------------------------------------
@@ -203,9 +216,14 @@ def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame) -> None:
         st.info("Momentan nu există un orar salvat. Poți genera unul nou din meniul din stânga.", icon="ℹ️")
         return
 
+    # Verifică dacă coloana ID există înainte de a o seta ca index
+    if COL_ID not in doctors_df.columns:
+        st.error("Coloana 'id' lipsește din foaia 'Doctors'. Verificați formatul fișierului.")
+        return
+        
     id2name = doctors_df.set_index(COL_ID)[COL_NAME].to_dict()
     df = schedule_df.copy()
-    df["doctor_name"] = df[COL_DOC_ID].map(id2name).fillna("ID Necunoscut")
+    df["doctor_name"] = df[COL_DOC_ID].map(id2name).fillna(f"ID Necunoscut")
     df["date_dt"] = pd.to_datetime(df[COL_DATE])
 
     view = st.radio("Alege vizualizare:", ["Grid", "Gantt"], horizontal=True, label_visibility="collapsed")
@@ -231,15 +249,17 @@ def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    """Funcția principală care rulează interfața Streamlit."""
     st.set_page_config(page_title="Orar Gărzi", layout="wide", initial_sidebar_state="expanded")
-    st.title("🩺 Organizator de Gărzi v3.7")
+    st.title("🩺 Organizator de Gărzi v4.1")
 
     try:
-        doctors_df_orig = load_df(SHEET_DOCTORS)
-        unav_df_orig = load_df(SHEET_UNAVAIL)
-        schedule_df = load_df(SHEET_SCHEDULE)
+        doctors_df_orig = load_and_clean_df(SHEET_DOCTORS)
+        unav_df_orig = load_and_clean_df(SHEET_UNAVAIL)
+        schedule_df = load_and_clean_df(SHEET_SCHEDULE)
     except Exception as e:
-        st.error(f"Eroare la încărcarea datelor: {e}", icon="🔥")
+        st.error(f"A apărut o eroare la încărcarea și validarea datelor: {e}", icon="🔥")
+        st.info("Verifică dacă foile de calcul din Google Sheets sunt formatate corect și încearcă din nou.")
         return
 
     with st.sidebar:
@@ -269,25 +289,42 @@ def main() -> None:
 
     with tab2:
         st.header("Editor Listă Medici")
-        edited_doctors = st.data_editor(doctors_df_orig, num_rows_to_add=2, use_container_width=True, key="doc_editor")
-        if not edited_doctors.compare(doctors_df_orig).empty:
+        edited_doctors = st.data_editor(
+            doctors_df_orig,
+            num_rows_to_add=2,
+            use_container_width=True,
+            key="doc_editor",
+            # Asigurăm configurarea coloanelor pentru o experiență mai bună
+            column_config={
+                 COL_ID: "ID",
+                 COL_NAME: "Nume",
+                 COL_SPEC: "Specialitate",
+                 COL_MAX: "Gărzi Max/Lună"
+            }
+        )
+        if not edited_doctors.compare(doctors_df_orig, keep_equal=True).empty:
             write_df(SHEET_DOCTORS, edited_doctors)
             st.success("✅ Lista medicilor a fost salvată!")
             st.rerun()
 
     with tab3:
         st.header("Editor Indisponibilități")
+        # Asigură-te că doctors_df_orig are date înainte de a accesa coloana ID
+        doc_id_options = []
+        if not doctors_df_orig.empty and COL_ID in doctors_df_orig.columns:
+            doc_id_options = doctors_df_orig[COL_ID].dropna().unique()
+
         edited_unav = st.data_editor(
             unav_df_orig,
             num_rows_to_add=5,
             use_container_width=True,
             column_config={
-                COL_UNAV_DOC: st.column_config.SelectboxColumn("ID Medic", options=doctors_df_orig[COL_ID].dropna().unique(), required=True),
+                COL_UNAV_DOC: st.column_config.SelectboxColumn("ID Medic", options=doc_id_options, required=True),
                 COL_UNAV_DATE: st.column_config.DateColumn("Data Indisponibilității", format="YYYY-MM-DD", required=True)
             },
             key="unav_editor"
         )
-        if not edited_unav.compare(unav_df_orig).empty:
+        if not edited_unav.compare(unav_df_orig, keep_equal=True).empty:
             write_df(SHEET_UNAVAIL, edited_unav)
             st.success("✅ Lista de indisponibilități a fost salvată!")
             st.rerun()
