@@ -1,17 +1,21 @@
 """streamlit_guard_scheduler.py
-Streamlit app for managing hospital on‑call (garda) rosters via Google Sheets
-and visualising the schedule in Streamlit.
 
-2025‑06‑14 v2.2
+Streamlit app – gestionează programul de gărzi (on‑call) într‑o foaie Google și
+oferă vizualizări Grid & Gantt. Include editor interactiv pentru medici și suport
+pentru indisponibilități.
+
+2025-06-15 v3.3 (Final)
 ────────────────
-• FIX syntax – removed extra parenthesis & bad indentation → no more SyntaxError.
-• Refactored `show_schedule()` for clarity.
-• Rest of the behaviour unchanged (auto‑create sheets, optional formatting gracefully handled).
+• FIX: Type hints complete pentru toate funcțiile.
+• FIX: Robustețe la citirea ID-urilor din Sheets (cast la Int64 pt. a preveni erori float).
+• FIX: Folosire .compare() în loc de .equals() pentru detecție sigură a modificărilor.
+• FIX: Limitarea avertismentelor (st.warning) la o singură notificare pe zi.
+• Toate celelalte funcționalități din v3.2 păstrate.
 """
 from __future__ import annotations
 
 import datetime as dt
-from typing import List, Dict
+from typing import Dict, List, Set, Tuple
 
 import altair as alt
 import pandas as pd
@@ -21,18 +25,38 @@ import gspread
 from gspread.utils import rowcol_to_a1
 
 # ──────────────────────────────────────────────────────────
-# Optional Google‑Sheets formatting (fails gracefully)
+# CONSTANTS
 # ──────────────────────────────────────────────────────────
+SHEET_DOCTORS = "Doctors"
+SHEET_SCHEDULE = "Schedule"
+SHEET_UNAVAIL = "Unavailability"
+
+COL_ID = "id"
+COL_NAME = "name"
+COL_SPEC = "speciality"
+COL_MAX = "max_shifts_per_month"
+
+COL_DATE = "date"
+COL_SHIFT = "shift_name"
+COL_DOC_ID = "doctor_id"
+
+COL_UNAV_DOC = "doctor_id"
+COL_UNAV_DATE = "date"
+
+# ---------------------------------------------------------------------------
+# Optional Google‑Sheets formatting (graceful fallback)
+# ---------------------------------------------------------------------------
 try:
     from gspread_formatting import (
+        BooleanRule,
         CellFormat,
         Color,
-        set_frozen,
         conditional_format,
-        BooleanRule,
+        set_frozen,
     )
+
     _FMT_AVAILABLE = True
-except ImportError:  # library absent – define NO‑OP stubs
+except ImportError:  # fallback no‑op
     _FMT_AVAILABLE = False
 
     def set_frozen(ws, rows=1, cols=0):  # type: ignore
@@ -48,192 +72,255 @@ except ImportError:  # library absent – define NO‑OP stubs
     class BooleanRule:  # type: ignore
         pass
 
-# ──────────────────────────────────────────────────────────
-# Google‑Sheets helpers
-# ──────────────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def get_gsheet_client():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+
+# ---------------------------------------------------------------------------
+# Google Sheets wrappers
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Conectare la Google API...")
+def get_gsheet_client() -> gspread.Client:
+    """Returnează un client gspread autorizat, folosind cache pentru resursă."""
     creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=scope
+        st.secrets["gcp_service_account"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(creds)
 
 
-def ensure_worksheet(sh, title: str, headers: List[str], rows: int = 200, cols: int = 20):
-    """Ensure a worksheet exists with the given headers and basic formatting."""
+def _apply_format(ws: gspread.Worksheet, headers: List[str], rows: int = 1000) -> None:
+    """Aplică formatare standard: header înghețat și rânduri alternate."""
+    if not _FMT_AVAILABLE:
+        return
+    set_frozen(ws, rows=1)
+    first_col = rowcol_to_a1(1, 1)[0]
+    last_col = rowcol_to_a1(1, len(headers))[0]
+    rng = f"{first_col}2:{last_col}{rows}"
+    conditional_format(
+        ws,
+        rng,
+        BooleanRule(
+            condition={
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": "=ISEVEN(ROW())"}],
+            },
+            format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95)),
+        ),
+    )
+
+
+def ensure_ws(sh: gspread.Spreadsheet, title: str, headers: List[str]) -> gspread.Worksheet:
+    """Asigură existența unui worksheet și aplică formatarea."""
     try:
         ws = sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
-
+        ws = sh.add_worksheet(title=title, rows="1000", cols=str(len(headers) + 2))
     if not any(ws.row_values(1)):
         ws.update([headers])
-
-    if _FMT_AVAILABLE:
-        set_frozen(ws, rows=1)
-        first_col = rowcol_to_a1(1, 1)[0]
-        last_col = rowcol_to_a1(1, len(headers))[0]
-        rng = f"{first_col}2:{last_col}{rows}"
-        conditional_format(
-            ws,
-            rng,
-            BooleanRule(
-                condition={
-                    "type": "CUSTOM_FORMULA",
-                    "values": [{"userEnteredValue": "=ISEVEN(ROW())"}],
-                },
-                format=CellFormat(backgroundColor=Color(0.95, 0.95, 0.95)),
-            ),
-        )
+    _apply_format(ws, headers)
     return ws
 
 
-@st.cache_data(ttl=300)
-def load_sheet(sheet_name: str) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner="Încărcare date din Google Sheets...")
+def load_df(sheet_name: str) -> pd.DataFrame:
+    """Încarcă un sheet într-un DataFrame, cu robustețe la tipuri de date."""
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
+    headers_map = {
+        SHEET_DOCTORS: [COL_ID, COL_NAME, COL_SPEC, COL_MAX],
+        SHEET_SCHEDULE: [COL_DATE, COL_SHIFT, COL_DOC_ID],
+        SHEET_UNAVAIL: [COL_UNAV_DOC, COL_UNAV_DATE],
+    }
+    ws = ensure_ws(sh, sheet_name, headers_map[sheet_name])
+    df = pd.DataFrame(ws.get_all_records()).reset_index(drop=True)
 
-    if sheet_name == "Doctors":
-        ws = ensure_worksheet(sh, "Doctors", ["id", "name", "speciality", "max_shifts_per_month"])
-    else:
-        ws = ensure_worksheet(sh, "Schedule", ["date", "shift_name", "doctor_id"])
+    # FIX: Prevenire erori de tip (ex: 1 -> 1.0) la citirea din Sheets
+    if sheet_name in (SHEET_DOCTORS, SHEET_SCHEDULE, SHEET_UNAVAIL):
+        id_col = COL_ID if sheet_name == SHEET_DOCTORS else COL_DOC_ID
+        if id_col in df.columns:
+            df[id_col] = pd.to_numeric(df[id_col], errors='coerce').astype('Int64')
 
-    return pd.DataFrame(ws.get_all_records())
+    return df
 
 
-def write_schedule(df: pd.DataFrame):
+def write_df(sheet_name: str, df: pd.DataFrame) -> None:
+    """Scrie un DataFrame într-un sheet, suprascriind conținutul existent."""
     client = get_gsheet_client()
     sh = client.open_by_key(st.secrets["sheet_id"])
-    ws = ensure_worksheet(sh, "Schedule", ["date", "shift_name", "doctor_id"])
+    headers_map = {
+        SHEET_DOCTORS: [COL_ID, COL_NAME, COL_SPEC, COL_MAX],
+        SHEET_SCHEDULE: [COL_DATE, COL_SHIFT, COL_DOC_ID],
+        SHEET_UNAVAIL: [COL_UNAV_DOC, COL_UNAV_DATE],
+    }
+    ws = ensure_ws(sh, sheet_name, headers_map[sheet_name])
     ws.clear()
-    ws.update([df.columns.values.tolist()] + df.values.tolist())
-    if _FMT_AVAILABLE:
-        set_frozen(ws, rows=1)
+    ws.update([df.columns.values.tolist()] + df.fillna("").values.tolist())
+    _apply_format(ws, df.columns.values.tolist(), rows=len(df) + 10)
+    st.cache_data.clear()
 
-# ──────────────────────────────────────────────────────────
-# Scheduler logic
-# ──────────────────────────────────────────────────────────
 
-def generate_round_robin(doctors: List[int], start: dt.date, end: dt.date, shifts_per_day: int = 1) -> pd.DataFrame:
-    if not doctors:
-        raise ValueError("Lista medicilor este goală – adaugă cel puțin un medic în tab‑ul 'Doctors'.")
+# ---------------------------------------------------------------------------
+# Scheduler Logic
+# ---------------------------------------------------------------------------
+def generate_schedule(
+    doctors_df: pd.DataFrame,
+    unav_df: pd.DataFrame,
+    start: dt.date,
+    end: dt.date,
+    shifts_per_day: int,
+) -> pd.DataFrame:
+    valid_doctors = doctors_df.dropna(subset=[COL_ID])
+    if valid_doctors.empty:
+        raise ValueError("Nu există medici cu ID valid în tab-ul Doctors.")
 
-    num_days = (end - start).days + 1
-    doctor_cycle = doctors * ((num_days * shifts_per_day) // len(doctors) + 1)
+    limits = {
+        r[COL_ID]: int(r[COL_MAX]) if pd.notna(r[COL_MAX]) and str(r[COL_MAX]).strip() else 9999
+        for _, r in valid_doctors.iterrows()
+    }
+    doc_ids = list(limits.keys())
 
+    unav_set = {
+        (r[COL_UNAV_DOC], pd.to_datetime(r[COL_UNAV_DATE]).date().isoformat())
+        for _, r in unav_df.dropna(subset=[COL_UNAV_DOC, COL_UNAV_DATE]).iterrows()
+    }
+
+    counts: Dict[int, Dict[Tuple[int, int], int]] = {d: {} for d in doc_ids}
     rows: List[Dict] = []
     idx = 0
-    for n in range(num_days):
-        cur_date = start + dt.timedelta(days=n)
+    cur = start
+    warned_dates: Set[dt.date] = set() # FIX: Set pentru a limita warning-urile
+
+    while cur <= end:
+        mkey = (cur.year, cur.month)
         for s in range(shifts_per_day):
-            rows.append(
-                {
-                    "date": cur_date.isoformat(),
-                    "shift_name": f"Shift {s+1}",
-                    "doctor_id": doctor_cycle[idx],
-                }
-            )
-            idx += 1
+            assigned = None
+            for attempt in range(len(doc_ids)):
+                doc_id = doc_ids[(idx + attempt) % len(doc_ids)]
+                if (doc_id, cur.isoformat()) in unav_set:
+                    continue
+                if counts.setdefault(doc_id, {}).get(mkey, 0) >= limits[doc_id]:
+                    continue
+                
+                assigned = doc_id
+                counts[doc_id][mkey] = counts[doc_id].get(mkey, 0) + 1
+                idx += attempt + 1
+                break
+            
+            if assigned is None:
+                if cur not in warned_dates:
+                    st.warning(f"Atenție {cur.strftime('%d-%m-%Y')}: Toți medicii sunt blocați. Se alocă forțat.")
+                    warned_dates.add(cur)
+                assigned = doc_ids[idx % len(doc_ids)]
+                idx += 1
+            
+            rows.append({COL_DATE: cur.isoformat(), COL_SHIFT: f"Tură {s+1}", COL_DOC_ID: assigned})
+        cur += dt.timedelta(days=1)
+        
     return pd.DataFrame(rows)
 
-# ──────────────────────────────────────────────────────────
-# UI helpers
-# ──────────────────────────────────────────────────────────
 
-def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
-    """Display schedule with either Pivot grid or Gantt-style Altair chart."""
+# ---------------------------------------------------------------------------
+# UI Components
+# ---------------------------------------------------------------------------
+def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame) -> None:
+    if schedule_df.empty:
+        st.info("Momentan nu există un orar salvat. Poți genera unul nou.")
+        return
 
-    # Map ID → Name and prep data
-    id2name = doctors_df.set_index("id")["name"].to_dict()
+    id2name = doctors_df.set_index(COL_ID)[COL_NAME].to_dict()
     df = schedule_df.copy()
-    df["doctor_name"] = df["doctor_id"].map(id2name)
-    df["date_dt"] = pd.to_datetime(df["date"])
-    df["date_end"] = df["date_dt"] + pd.Timedelta(days=1)
+    df["doctor_name"] = df[COL_DOC_ID].map(id2name).fillna("ID Necunoscut")
+    df["date_dt"] = pd.to_datetime(df[COL_DATE])
 
-    # Sidebar selector inside the expander for compact UI
-    with st.expander("Alege vizualizarea", expanded=True):
-        view = st.radio("Tip grafic", ["Grid", "Gantt"], horizontal=True)
-
+    view = st.radio("Alege vizualizare:", ["Grid", "Gantt"], horizontal=True, label_visibility="collapsed")
+    
     if view == "Grid":
-        # Pivot table view
-        st.subheader("📅 Calendar (pivot)")
-        pivot = df.pivot(index="date", columns="shift_name", values="doctor_name")
-        st.dataframe(pivot, use_container_width=True)
-
-        # Heat‑map grid
-        st.subheader("🖼️ Heat‑map grid")
-        df["date_str"] = df["date_dt"].dt.strftime("%Y-%m-%d")
-        chart = (
+        st.dataframe(df.pivot(index=COL_DATE, columns=COL_SHIFT, values="doctor_name"), use_container_width=True)
+    else:
+        df["date_end"] = df["date_dt"] + pd.Timedelta(days=1)
+        gantt = (
             alt.Chart(df)
-            .mark_rect()
+            .mark_bar(cornerRadius=5, height=20)
             .encode(
-                x=alt.X("date_str:O", title="Data", axis=alt.Axis(labelAngle=-45)),
-                y=alt.Y("doctor_name:N", title="Medic"),
-                color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
-                tooltip=["date_str", "doctor_name", "shift_name"],
+                y=alt.Y("doctor_name:N", title="Medic", sort=None),
+                x=alt.X("date_dt:T", title="Data"),
+                x2=alt.X2("date_end:T"),
+                color=alt.Color(COL_SHIFT, type="nominal", legend=alt.Legend(title="Tip Tură")),
+                tooltip=[
+                    alt.Tooltip("date_dt:T", title="Dată", format="%d %B %Y"),
+                    alt.Tooltip("doctor_name:N", title="Medic"),
+                    alt.Tooltip(COL_SHIFT, title="Tura"),
+                ],
             )
-            .properties(width="container", height=500)
+            .properties(height=alt.Step(30))
         )
-        st.altair_chart(chart, use_container_width=True)
-
-    else:  # Gantt view
-        st.subheader("📊 Vizualizare Gantt")
-        base = alt.Chart(df).encode(
-            y=alt.Y("doctor_name:N", title="Medic"),
-            color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
-        )
-        gantt = base.mark_bar().encode(
-            x=alt.X("date_dt:T", title="Început"),
-            x2=alt.X2("date_end:T", title="Sfârșit"),
-            tooltip=["doctor_name", "shift_name", alt.Tooltip("date_dt:T", title="Dată")],
-        ).properties(width="container", height=500)
         st.altair_chart(gantt, use_container_width=True)
 
-def main()():
-    st.title("🩺 Organizator de Gărzi – v2.2")
 
-    # Sidebar controls
+def main() -> None:
+    st.set_page_config(page_title="Orar Gărzi", layout="wide", initial_sidebar_state="expanded")
+    st.title("🩺 Organizator de Gărzi v3.3")
+
+    try:
+        doctors_df_orig = load_df(SHEET_DOCTORS)
+        unav_df_orig = load_df(SHEET_UNAVAIL)
+        schedule_df = load_df(SHEET_SCHEDULE)
+    except Exception as e:
+        st.error(f"Eroare la încărcarea datelor din Google Sheets: {e}", icon="🔥")
+        return
+
     with st.sidebar:
-        st.header("📅 Interval")
+        st.header("🗓️ Perioadă Orar")
         today = dt.date.today()
         start_date = st.date_input("Început", today)
         end_date = st.date_input("Sfârșit", today + dt.timedelta(days=30))
-        shifts_per_day = st.number_input("Gărzi/zi", 1, 4, 1)
+        shifts_pd = st.number_input("Ture pe zi", 1, 4, 1, help="Câte ture de gardă sunt în 24 de ore.")
+
         st.markdown("---")
+        st.header("⚡ Acțiuni")
+        if st.button("Generează Orar Nou", type="primary", use_container_width=True):
+            with st.spinner("🧠 Se gândește algoritmul..."):
+                try:
+                    new_df = generate_schedule(doctors_df_orig, unav_df_orig, start_date, end_date, shifts_pd)
+                    write_df(SHEET_SCHEDULE, new_df)
+                    st.success("Orar nou generat și salvat!")
+                    st.rerun()
+                except (ValueError, IndexError) as e:
+                    st.error(str(e))
 
-    # Load data
-    doctors_df = load_sheet("Doctors")
-    schedule_df = load_sheet("Schedule")
+    tab1, tab2, tab3 = st.tabs(["🗓️ Orar Gărzi", "👩‍⚕️ Lista Medici", "🚫 Indisponibilități"])
 
-    # Doctors table
-    st.subheader("👩‍⚕️ Medici")
-    if doctors_df.empty:
-        st.warning("Lista medicilor e goală – completează tab‑ul 'Doctors' în Google Sheets.")
-    else:
-        st.dataframe(doctors_df, use_container_width=True)
+    with tab1:
+        st.header("Vizualizare Orar")
+        show_schedule(schedule_df, doctors_df_orig)
 
-    # Generate schedule
-    if st.button("Generează orar", type="primary"):
-        try:
-            new_df = generate_round_robin(
-                doctors_df["id"].tolist(), start_date, end_date, shifts_per_day
-            )
-            write_schedule(new_df)
-            schedule_df = new_df  # refresh local copy
-            st.success("Orar salvat și afișat mai jos!")
-        except Exception as e:
-            st.error(str(e))
+    with tab2:
+        st.header("Editor Listă Medici")
+        edited_doctors = st.data_editor(doctors_df_orig, num_rows_to_add=2, use_container_width=True, key="doc_editor")
+        
+        # FIX: Folosim .compare() pentru o detecție robustă a schimbărilor
+        if not edited_doctors.compare(doctors_df_orig).empty:
+            write_df(SHEET_DOCTORS, edited_doctors)
+            st.success("Lista medicilor a fost salvată!")
+            st.rerun()
 
-    # Display schedule
-    if not schedule_df.empty:
-        show_schedule(schedule_df, doctors_df)
-    else:
-        st.info("Încă nu există orar salvat.")
-
+    with tab3:
+        st.header("Editor Indisponibilități")
+        edited_unav = st.data_editor(
+            unav_df_orig,
+            num_rows_to_add=5,
+            use_container_width=True,
+            column_config={
+                COL_UNAV_DOC: st.column_config.SelectboxColumn("ID Medic", options=doctors_df_orig[COL_ID].dropna().unique(), required=True),
+                COL_UNAV_DATE: st.column_config.DateColumn("Data Indisponibilității", format="YYYY-MM-DD", required=True)
+            },
+            key="unav_editor"
+        )
+        if not edited_unav.compare(unav_df_orig).empty:
+            write_df(SHEET_UNAVAIL, edited_unav)
+            st.success("Lista de indisponibilități a fost salvată!")
+            st.rerun()
 
 if __name__ == "__main__":
     main()
