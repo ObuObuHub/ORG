@@ -1,4 +1,6 @@
-"""streamlit_guard_scheduler.py
+if st.sidebar.checkbox("🎲 Folosește seed fix", help="Pentru rezultate reproductibile"):
+                    seed = st.sidebar.number_input("Seed", min_value=0, value=42)
+                    random.seed(seed)"""streamlit_guard_scheduler.py
 
 Aplicație Streamlit pentru gestionarea programului de gărzi medicale.
 Versiune îmbunătățită cu algoritm mai inteligent și interfață mai prietenoasă.
@@ -591,14 +593,14 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Selectează spitalul PRIMUL lucru și salvează sheet_id
+    # Selectează spitalul și salvează sheet_id în session_state
     sheet_id = select_hospital()
-    st.session_state["sheet_id"] = sheet_id  # CRUCIAL: salvăm în session_state
+    st.session_state["sheet_id"] = sheet_id  # CRUCIAL pentru load_data și save_data
     
     # Obține numele spitalului pentru afișare
     hospitals = get_hospital_config()
     hospital_name = hospitals.get(
-        st.session_state.get('selected_hospital', 'piatra_neamt'), 
+        st.session_state.get('selected_hospital', list(hospitals.keys())[0]), 
         {}
     ).get('name', 'Spital')
     
