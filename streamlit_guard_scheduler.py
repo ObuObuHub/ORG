@@ -156,21 +156,21 @@ def show_schedule(schedule_df: pd.DataFrame, doctors_df: pd.DataFrame):
     st.subheader("📅 Calendar (pivot)")
     st.dataframe(pivot, use_container_width=True)
 
-    # Altair heatmap
+        # Altair heatmap (grid‑style)
     st.subheader("🖼️ Vizualizare grafică")
-    schedule_df["date"] = pd.to_datetime(schedule_df["date"])
+    schedule_df["date_str"] = pd.to_datetime(schedule_df["date"]).dt.strftime("%Y-%m-%d")
     chart = (
         alt.Chart(schedule_df)
         .mark_rect()
         .encode(
-            x=alt.X("date:T", title="Data", axis=alt.Axis(labelAngle=-45)),
+            x=alt.X("date_str:O", title="Data", axis=alt.Axis(labelAngle=-45)),
             y=alt.Y("doctor_name:N", title="Medic"),
             color=alt.Color("shift_name:N", legend=alt.Legend(title="Tură")),
-            tooltip=["date:T", "doctor_name", "shift_name"]
+            tooltip=["date_str", "doctor_name", "shift_name"]
         )
-        .properties(width="container", height=400)
+        .properties(width='container', height=500)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, use_container_width=True(chart, use_container_width=True)
 
 # ──────────────────────────────────────────────────────────
 # Main Streamlit app
