@@ -838,7 +838,7 @@ def main():
             for idx, row in display_df.iterrows():
                 col1, col2, col3, col4 = st.columns([3, 2, 3, 1])
                 with col1:
-                    st.write(f"**{row['Medic']}**")
+                    st.write(f"**{row['Personal']}**")
                 with col2:
                     st.write(row['Data'])
                 with col3:
