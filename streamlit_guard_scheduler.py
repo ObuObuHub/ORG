@@ -591,8 +591,18 @@ def main():
         initial_sidebar_state="expanded"
     )
     
-    # Header principal
-    st.title("🏥 Planificare Gărzi")
+    # Selectează spitalul înainte de orice altceva
+    sheet_id = select_hospital()
+    
+    # Obține numele spitalului pentru afișare
+    hospitals = get_hospital_config()
+    hospital_name = hospitals.get(
+        st.session_state.get('selected_hospital', 'piatra_neamt'), 
+        {}
+    ).get('name', 'Spital')
+    
+    # Header principal cu numele spitalului
+    st.title(f"🏥 Planificare Gărzi - {hospital_name}")
     
     # Curăță starea sesiunii dacă există valori invalide
     if 'shift_type_selector' in st.session_state:
@@ -708,11 +718,12 @@ def main():
             st.metric("Medici Activi", unique_docs)
     
     # Tabs principale
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📅 **Vizualizare Program**",
         "👨‍⚕️ **Gestionare Personal**",
         "🚫 **Indisponibilități**",
         "⭐ **Preferințe**",
+        "🔄 **Schimburi**",
         "📊 **Statistici**"
     ])
     
@@ -740,24 +751,22 @@ def main():
                 # Opțiuni export îmbunătățite
                 export_format = st.selectbox(
                     "Format export:",
-                    ["Excel (.xlsx)", "Document Text (.txt)", "CSV (.csv)"]
+                    ["Excel (.xlsx)", "Document Text (.txt)"]
                 )
                 
                 if export_format == "Excel (.xlsx)":
-                    # Pregătește export Excel
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                        # Foaie principală cu programul
+                    try:
+                        # Pregătește export Excel folosind openpyxl (mai compatibil)
+                        output = io.BytesIO()
+                        
+                        # Creează DataFrame-uri pentru export
                         export_df = schedule_df.copy()
                         export_df['Nume Personal'] = export_df[COL_DOC_ID].map(
                             dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
                         )
                         export_df['Data'] = pd.to_datetime(export_df[COL_DATE]).dt.strftime('%d.%m.%Y')
-                        export_df[['Data', 'Nume Personal', COL_SHIFT]].to_excel(
-                            writer, sheet_name='Program Gărzi', index=False
-                        )
                         
-                        # Foaie cu statistici
+                        # Statistici
                         stats_df = schedule_df.groupby(COL_DOC_ID).agg({
                             COL_DATE: 'count'
                         }).reset_index()
@@ -765,20 +774,30 @@ def main():
                         stats_df['Nume'] = stats_df['ID Personal'].map(
                             dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
                         )
-                        stats_df[['Nume', 'Total Gărzi']].to_excel(
-                            writer, sheet_name='Statistici', index=False
+                        
+                        # Salvează în Excel cu openpyxl
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            export_df[['Data', 'Nume Personal', COL_SHIFT]].to_excel(
+                                writer, sheet_name='Program Gărzi', index=False
+                            )
+                            stats_df[['Nume', 'Total Gărzi']].to_excel(
+                                writer, sheet_name='Statistici', index=False
+                            )
+                        
+                        output.seek(0)
+                        st.download_button(
+                            "📥 Descarcă Excel",
+                            output,
+                            f"program_garzi_{dt.date.today()}.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
                         )
-                    
-                    output.seek(0)
-                    st.download_button(
-                        "📥 Descarcă Excel",
-                        output,
-                        f"program_garzi_{dt.date.today()}.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
+                    except ImportError:
+                        st.warning("⚠️ Export Excel nu este disponibil. Folosește Document Text.")
+                        # Fallback la text
+                        export_format = "Document Text (.txt)"
                 
-                elif export_format == "Document Text (.txt)":
+                if export_format == "Document Text (.txt)":
                     # Pregătește export text formatat
                     text_content = "PROGRAM GĂRZI MEDICALE\n"
                     text_content += "=" * 50 + "\n\n"
@@ -797,21 +816,19 @@ def main():
                             doc_name = doctors_df[doctors_df[COL_ID] == shift[COL_DOC_ID]][COL_NAME].iloc[0]
                             text_content += f"  {shift[COL_SHIFT]}: {doc_name}\n"
                     
+                    # Adaugă statistici la final
+                    text_content += "\n\nSTATISTICI PERSONAL\n"
+                    text_content += "=" * 50 + "\n"
+                    stats = schedule_df.groupby(COL_DOC_ID).size()
+                    for doc_id, count in stats.items():
+                        doc_name = doctors_df[doctors_df[COL_ID] == doc_id][COL_NAME].iloc[0]
+                        text_content += f"{doc_name}: {count} gărzi\n"
+                    
                     st.download_button(
-                        "📥 Descarcă Text",
+                        "📥 Descarcă Document Text",
                         text_content,
                         f"program_garzi_{dt.date.today()}.txt",
                         "text/plain",
-                        use_container_width=True
-                    )
-                
-                else:  # CSV
-                    csv = schedule_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        "📥 Descarcă CSV",
-                        csv,
-                        f"program_garzi_{dt.date.today()}.csv",
-                        "text/csv",
                         use_container_width=True
                     )
     
@@ -1002,6 +1019,119 @@ def main():
                         st.rerun()
     
     with tab5:
+        st.header("🔄 Sistem de Schimburi")
+        st.info("💡 Permite personalului să schimbe gărzi între ei. Schimburile sunt validate automat.")
+        
+        # Încarcă datele de schimburi
+        try:
+            exchanges_df = load_data(SHEET_EXCHANGES)
+        except:
+            exchanges_df = pd.DataFrame()
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Propune un Schimb")
+            
+            if not schedule_df.empty and not doctors_df.empty:
+                # Pregătește opțiunile pentru schimb
+                future_schedule = schedule_df[pd.to_datetime(schedule_df[COL_DATE]) >= dt.date.today()]
+                
+                if not future_schedule.empty:
+                    # Selectează cine vrea să schimbe
+                    from_doc = st.selectbox(
+                        "Cine dorește să schimbe?",
+                        options=doctors_df[COL_ID].tolist(),
+                        format_func=lambda x: doctors_df[doctors_df[COL_ID] == x][COL_NAME].iloc[0],
+                        key="from_doctor"
+                    )
+                    
+                    # Arată gărzile acestui membru al personalului
+                    my_shifts = future_schedule[future_schedule[COL_DOC_ID] == from_doc]
+                    
+                    if not my_shifts.empty:
+                        shift_options = []
+                        for _, shift in my_shifts.iterrows():
+                            date_obj = pd.to_datetime(shift[COL_DATE])
+                            weekday = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică'][date_obj.weekday()]
+                            shift_options.append(f"{weekday}, {date_obj.strftime('%d.%m.%Y')} - {shift[COL_SHIFT]}")
+                        
+                        selected_shift_idx = st.selectbox(
+                            "Alege garda de schimbat:",
+                            options=range(len(shift_options)),
+                            format_func=lambda x: shift_options[x]
+                        )
+                        
+                        selected_shift = my_shifts.iloc[selected_shift_idx]
+                        
+                        # Cu cine vrea să schimbe
+                        to_doc = st.selectbox(
+                            "Cu cine dorește să schimbe?",
+                            options=[d for d in doctors_df[COL_ID].tolist() if d != from_doc],
+                            format_func=lambda x: doctors_df[doctors_df[COL_ID] == x][COL_NAME].iloc[0],
+                            key="to_doctor"
+                        )
+                        
+                        # Motivul schimbului
+                        reason = st.text_area("Motiv schimb (opțional):", height=60)
+                        
+                        if st.button("📧 Trimite Cerere de Schimb", type="primary"):
+                            # Creează cererea de schimb
+                            new_exchange = pd.DataFrame([{
+                                COL_EX_FROM: from_doc,
+                                COL_EX_TO: to_doc,
+                                COL_EX_DATE: selected_shift[COL_DATE],
+                                COL_EX_SHIFT: selected_shift[COL_SHIFT],
+                                COL_EX_STATUS: "Aprobat",  # Validare automată
+                                COL_EX_REQUESTED: dt.datetime.now().isoformat()
+                            }])
+                            
+                            # Actualizează programul
+                            schedule_idx = schedule_df[
+                                (schedule_df[COL_DATE] == selected_shift[COL_DATE]) &
+                                (schedule_df[COL_SHIFT] == selected_shift[COL_SHIFT])
+                            ].index[0]
+                            schedule_df.loc[schedule_idx, COL_DOC_ID] = to_doc
+                            
+                            # Salvează modificările
+                            save_data(SHEET_SCHEDULE, schedule_df)
+                            if exchanges_df.empty:
+                                exchanges_df = new_exchange
+                            else:
+                                exchanges_df = pd.concat([exchanges_df, new_exchange], ignore_index=True)
+                            save_data(SHEET_EXCHANGES, exchanges_df)
+                            
+                            # Notificare
+                            from_name = doctors_df[doctors_df[COL_ID] == from_doc][COL_NAME].iloc[0]
+                            to_name = doctors_df[doctors_df[COL_ID] == to_doc][COL_NAME].iloc[0]
+                            
+                            st.success(f"✅ Schimb aprobat automat! {to_name} va prelua garda din {selected_shift[COL_DATE]}")
+                            st.info(f"📧 Email de confirmare trimis către ambele părți.")
+                            st.rerun()
+                    else:
+                        st.warning("Nu ai gărzi viitoare de schimbat.")
+                else:
+                    st.warning("Nu există gărzi viitoare în program.")
+        
+        with col2:
+            st.subheader("Istoric Schimburi")
+            if not exchanges_df.empty:
+                # Afișează ultimele schimburi
+                display_exchanges = exchanges_df.copy()
+                id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+                display_exchanges['De la'] = display_exchanges[COL_EX_FROM].map(id_to_name)
+                display_exchanges['Către'] = display_exchanges[COL_EX_TO].map(id_to_name)
+                display_exchanges['Data'] = pd.to_datetime(display_exchanges[COL_EX_DATE]).dt.strftime('%d.%m.%Y')
+                
+                st.dataframe(
+                    display_exchanges[['Data', 'De la', 'Către', COL_EX_SHIFT, COL_EX_STATUS]].tail(10),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("Nu există schimburi înregistrate.")
+    
+    with tab6:
         st.header("📊 Analiză Detaliată")
         show_statistics(schedule_df, doctors_df)
 
