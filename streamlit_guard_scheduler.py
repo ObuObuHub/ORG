@@ -797,7 +797,6 @@ def main():
                         )
                     except ImportError:
                         st.warning("⚠️ Export Excel nu este disponibil. Folosește Document Text.")
-                        # Fallback la text
                         export_format = "Document Text (.txt)"
                 
                 if export_format == "Document Text (.txt)":
