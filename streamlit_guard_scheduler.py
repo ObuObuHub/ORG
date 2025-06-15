@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sistem de Planificare Gărzi cu Rezervări
-Versiune: 8.0 - Flux bazat pe rezervări și priorități
+Sistem Simplificat de Planificare Gărzi Medicale
+Versiune: 9.0 - Design inspirat din aplicații medicale de succes
 """
 
 import streamlit as st
@@ -11,19 +11,24 @@ import numpy as np
 from datetime import datetime, timedelta, date
 import gspread
 from google.oauth2.service_account import Credentials
+import plotly.express as px
+import plotly.graph_objects as go
 from collections import defaultdict
 import calendar
-import random
-import json
 
 # ──────────────────────────────────────────────────────────
 # CONFIGURARE ȘI CONSTANTE
 # ──────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="🏥 Planificare Gărzi Medicale",
+    page_icon="🏥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # Nume foi în Google Sheets
 SHEET_DOCTORS = "Doctors"
 SHEET_SCHEDULE = "Schedule"
-SHEET_RESERVATIONS = "Reservations"
-SHEET_PRIORITIES = "Priorities"
 SHEET_UNAVAILABLE = "Unavailable"
 
 # Coloane principale
@@ -36,20 +41,6 @@ COL_EMAIL = "email"
 COL_DATE = "date"
 COL_SHIFT = "shift_name"
 COL_DOC_ID = "doctor_id"
-COL_STATUS = "status"  # Pentru rezervări: pending, approved, rejected
-
-# Coloane rezervări
-COL_RES_ID = "reservation_id"
-COL_RES_DOC = "doctor_id"
-COL_RES_DATE = "date"
-COL_RES_SHIFT = "shift_type"
-COL_RES_STATUS = "status"
-COL_RES_TIMESTAMP = "timestamp"
-
-# Coloane priorități
-COL_PRIO_DOC = "doctor_id"
-COL_PRIO_MONTH = "month"
-COL_PRIO_SCORE = "priority_score"
 
 # Specialități
 SPECIALTIES = [
@@ -63,28 +54,36 @@ SPECIALTIES = [
     "Altele"
 ]
 
-# Tipuri de ture
-SHIFT_TYPES = {
-    "24h": "Gardă 24h",
-    "zi": "Gardă Zi (08-20)",
-    "noapte": "Gardă Noapte (20-08)"
+# Tipuri de ture cu coduri de culoare
+SHIFT_CONFIGS = {
+    "Gardă 24h": {"color": "#DC3545", "icon": "🔴", "hours": 24},
+    "Gardă Zi (08-20)": {"color": "#28A745", "icon": "🟢", "hours": 12},
+    "Gardă Noapte (20-08)": {"color": "#17A2B8", "icon": "🔵", "hours": 12}
 }
 
 # Zile săptămână în română
 WEEKDAYS_RO = ['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică']
 
-# Parolă manager
+# Parola manager pentru funcții administrative
 MANAGER_PASSWORD = "admin123"
 
-# Culori pentru calendar
-COLORS = {
-    "24h": "#DC3545",
-    "zi": "#28A745",
-    "noapte": "#17A2B8",
-    "reserved": "#FFC107",
-    "unavailable": "#6C757D",
-    "weekend": "#FFF3CD"
-}
+# ──────────────────────────────────────────────────────────
+# Inițializare Session State
+# ──────────────────────────────────────────────────────────
+def init_session_state():
+    """Inițializează toate variabilele de sesiune necesare."""
+    if 'schedule_data' not in st.session_state:
+        st.session_state.schedule_data = pd.DataFrame()
+    if 'selected_user' not in st.session_state:
+        st.session_state.selected_user = None
+    if 'user_role' not in st.session_state:
+        st.session_state.user_role = 'viewer'
+    if 'view_mode' not in st.session_state:
+        st.session_state.view_mode = 'calendar'
+    if 'selected_month' not in st.session_state:
+        st.session_state.selected_month = date.today().month
+    if 'selected_year' not in st.session_state:
+        st.session_state.selected_year = date.today().year
 
 # ──────────────────────────────────────────────────────────
 # Funcții pentru configurare spitale
@@ -104,32 +103,12 @@ def get_hospital_config():
         st.error("❌ Lipsește configurația în secrets.toml!")
         st.stop()
 
-def select_hospital():
-    """Permite selectarea spitalului."""
-    hospitals = get_hospital_config()
-    keys = list(hospitals.keys())
-    
-    if len(keys) == 1:
-        st.session_state["selected_hospital"] = keys[0]
-        return hospitals[keys[0]]["sheet_id"]
-    
-    with st.sidebar:
-        st.markdown("### 🏥 Selectează Spitalul")
-        selected = st.selectbox(
-            "Spital:",
-            options=keys,
-            format_func=lambda x: hospitals[x]["name"]
-        )
-    
-    st.session_state["selected_hospital"] = selected
-    return hospitals[selected]["sheet_id"]
-
 # ──────────────────────────────────────────────────────────
-# Funcții Google Sheets
+# Funcții Google Sheets cu caching
 # ──────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gsheet_client():
-    """Creează clientul Google Sheets."""
+    """Creează clientul Google Sheets cu caching."""
     try:
         creds = Credentials.from_service_account_info(
             st.secrets["gcp_service_account"],
@@ -140,14 +119,12 @@ def get_gsheet_client():
         st.error(f"❌ Eroare conectare: {str(e)}")
         st.stop()
 
-def load_data(sheet_name):
-    """Încarcă date din foaia specificată."""
-    if "sheet_id" not in st.session_state:
-        return pd.DataFrame()
-    
+@st.cache_data(ttl=60)  # Cache pentru 1 minut
+def load_data(sheet_name, sheet_id):
+    """Încarcă date din foaia specificată cu caching."""
     try:
         client = get_gsheet_client()
-        sh = client.open_by_key(st.session_state["sheet_id"])
+        sh = client.open_by_key(sheet_id)
         
         try:
             worksheet = sh.worksheet(sheet_name)
@@ -162,14 +139,14 @@ def load_data(sheet_name):
         st.error(f"❌ Eroare încărcare date: {str(e)}")
         return pd.DataFrame()
 
-def save_data(sheet_name, df):
+def save_data(sheet_name, df, sheet_id):
     """Salvează date în foaia specificată."""
-    if "sheet_id" not in st.session_state or df is None:
+    if df is None:
         return
     
     try:
         client = get_gsheet_client()
-        sh = client.open_by_key(st.session_state["sheet_id"])
+        sh = client.open_by_key(sheet_id)
         
         try:
             worksheet = sh.worksheet(sheet_name)
@@ -183,553 +160,310 @@ def save_data(sheet_name, df):
             data = [headers] + values
             worksheet.update(data, value_input_option='USER_ENTERED')
             
+        # Invalidate cache after save
+        load_data.clear()
+            
     except Exception as e:
         st.error(f"❌ Eroare salvare: {str(e)}")
 
 # ──────────────────────────────────────────────────────────
-# Funcții pentru autentificare
+# Selector simplu pentru utilizatori (fără login)
 # ──────────────────────────────────────────────────────────
-def check_auth():
-    """Verifică tipul de utilizator autentificat."""
-    return st.session_state.get('user_role', None)
-
-def show_login():
-    """Afișează interfața de autentificare."""
-    st.title("🏥 Sistem Planificare Gărzi")
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        st.markdown("### 🔐 Autentificare")
+def create_user_selector(doctors_df):
+    """Creează selector pentru utilizatori fără autentificare."""
+    with st.sidebar:
+        st.markdown("### 👤 Selectează Utilizator")
         
-        role = st.radio(
-            "Selectează rolul:",
-            ["Medic", "Manager"],
-            horizontal=True
+        # Rol utilizator
+        role = st.selectbox(
+            "Tip utilizator:",
+            ["Vizualizare", "Medic", "Manager"],
+            help="Selectează rolul pentru a accesa funcționalitățile"
         )
         
-        if role == "Medic":
-            doctors_df = load_data(SHEET_DOCTORS)
+        if role == "Manager":
+            password = st.text_input("Parolă manager:", type="password")
+            if password == MANAGER_PASSWORD:
+                st.session_state.user_role = 'manager'
+                st.success("✅ Acces manager activat")
+            else:
+                st.session_state.user_role = 'viewer'
+                if password:
+                    st.error("❌ Parolă incorectă")
+        elif role == "Medic":
+            st.session_state.user_role = 'doctor'
+            
+            # Selector medic cu filtrare
             if not doctors_df.empty:
+                # Filtrare după specialitate
+                specialities = ["Toate"] + doctors_df[COL_SPEC].unique().tolist()
+                selected_spec = st.selectbox("Specialitate:", specialities)
+                
+                # Filtrare medici
+                if selected_spec == "Toate":
+                    filtered_doctors = doctors_df
+                else:
+                    filtered_doctors = doctors_df[doctors_df[COL_SPEC] == selected_spec]
+                
+                # Selector medic
                 doctor_options = dict(zip(
-                    doctors_df[COL_NAME] + " - " + doctors_df[COL_SPEC],
-                    doctors_df[COL_ID]
+                    filtered_doctors[COL_NAME] + " - " + filtered_doctors[COL_SPEC],
+                    filtered_doctors[COL_ID]
                 ))
                 
-                selected = st.selectbox(
-                    "Selectează numele tău:",
-                    list(doctor_options.keys())
-                )
-                
-                if st.button("Intră", type="primary", use_container_width=True):
-                    st.session_state['user_role'] = 'doctor'
-                    st.session_state['doctor_id'] = doctor_options[selected]
-                    st.session_state['doctor_name'] = selected.split(" - ")[0]
-                    st.rerun()
-            else:
-                st.error("Nu există medici înregistrați în sistem!")
-        
-        else:  # Manager
-            password = st.text_input("Parolă:", type="password")
-            
-            if st.button("Autentificare", type="primary", use_container_width=True):
-                if password == MANAGER_PASSWORD:
-                    st.session_state['user_role'] = 'manager'
-                    st.success("✅ Autentificare reușită!")
-                    st.rerun()
+                if doctor_options:
+                    selected = st.selectbox(
+                        "Selectează numele tău:",
+                        list(doctor_options.keys())
+                    )
+                    st.session_state.selected_user = {
+                        'id': doctor_options[selected],
+                        'name': selected.split(" - ")[0],
+                        'role': 'doctor'
+                    }
                 else:
-                    st.error("❌ Parolă incorectă!")
-
-def logout():
-    """Deconectare utilizator."""
-    for key in ['user_role', 'doctor_id', 'doctor_name']:
-        if key in st.session_state:
-            del st.session_state[key]
-    st.rerun()
-
-# ──────────────────────────────────────────────────────────
-# Funcții pentru rezervări
-# ──────────────────────────────────────────────────────────
-def get_doctor_reservations(doctor_id, reservations_df):
-    """Obține rezervările unui medic."""
-    if reservations_df.empty:
-        return pd.DataFrame()
-    
-    return reservations_df[reservations_df[COL_RES_DOC] == doctor_id]
-
-def get_unavailable_dates(doctor_id, unavail_df):
-    """Obține datele când medicul nu e disponibil."""
-    if unavail_df.empty:
-        return set()
-    
-    doctor_unavail = unavail_df[unavail_df['doctor_id'] == doctor_id]
-    return set(pd.to_datetime(doctor_unavail['date']).dt.date)
-
-def add_reservation(doctor_id, selected_date, shift_type, reservations_df):
-    """Adaugă o rezervare nouă."""
-    new_reservation = pd.DataFrame([{
-        COL_RES_ID: f"RES_{datetime.now().timestamp()}",
-        COL_RES_DOC: doctor_id,
-        COL_RES_DATE: selected_date.strftime('%Y-%m-%d'),
-        COL_RES_SHIFT: shift_type,
-        COL_RES_STATUS: 'pending',
-        COL_RES_TIMESTAMP: datetime.now().isoformat()
-    }])
-    
-    if reservations_df.empty:
-        return new_reservation
-    else:
-        return pd.concat([reservations_df, new_reservation], ignore_index=True)
-
-def show_reservation_calendar(doctor_id, doctor_name, reservations_df, unavail_df, schedule_df):
-    """Afișează calendar pentru rezervări."""
-    st.subheader(f"📅 Calendar Rezervări - {doctor_name}")
-    
-    # Obține rezervările și indisponibilitățile
-    my_reservations = get_doctor_reservations(doctor_id, reservations_df)
-    unavailable_dates = get_unavailable_dates(doctor_id, unavail_df)
-    
-    # Selectoare pentru dată și tip gardă
-    col1, col2, col3 = st.columns([2, 2, 1])
-    
-    with col1:
-        selected_date = st.date_input(
-            "Selectează data:",
-            min_value=date.today(),
-            max_value=date.today() + timedelta(days=60)
-        )
-    
-    with col2:
-        shift_type = st.selectbox(
-            "Tip gardă:",
-            options=list(SHIFT_TYPES.keys()),
-            format_func=lambda x: SHIFT_TYPES[x]
-        )
-    
-    with col3:
-        # Verificări pentru adăugare
-        can_add = True
-        reason = ""
-        
-        if selected_date in unavailable_dates:
-            can_add = False
-            reason = "Ești indisponibil în această zi"
-        elif not my_reservations.empty:
-            existing = my_reservations[
-                (pd.to_datetime(my_reservations[COL_RES_DATE]).dt.date == selected_date)
-            ]
-            if not existing.empty:
-                can_add = False
-                reason = "Ai deja o rezervare în această zi"
-        
-        if can_add:
-            if st.button("➕ Rezervă", type="primary", use_container_width=True):
-                updated_reservations = add_reservation(doctor_id, selected_date, shift_type, reservations_df)
-                save_data(SHEET_RESERVATIONS, updated_reservations)
-                st.success("✅ Rezervare adăugată!")
-                st.rerun()
+                    st.warning("Nu există medici în această specialitate")
         else:
-            st.error(reason)
+            st.session_state.user_role = 'viewer'
+            st.session_state.selected_user = None
+
+# ──────────────────────────────────────────────────────────
+# Vizualizare Calendar Principal
+# ──────────────────────────────────────────────────────────
+def show_calendar_view(schedule_df, doctors_df, selected_month, selected_year):
+    """Afișează calendar lunar cu gărzi."""
+    # Mapare ID -> Nume
+    id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
     
-    # Vizualizare calendar lunar
-    st.divider()
+    # Selector lună/an
+    col1, col2, col3 = st.columns([2, 2, 8])
+    with col1:
+        month = st.selectbox(
+            "Luna:",
+            range(1, 13),
+            index=selected_month - 1,
+            format_func=lambda x: calendar.month_name[x]
+        )
+    with col2:
+        year = st.selectbox(
+            "An:",
+            range(2024, 2027),
+            index=selected_year - 2024
+        )
     
-    # Luna curentă
-    today = date.today()
-    cal = calendar.monthcalendar(today.year, today.month)
+    # Actualizează session state
+    st.session_state.selected_month = month
+    st.session_state.selected_year = year
     
-    st.markdown(f"### {today.strftime('%B %Y')}")
+    # Calendar
+    cal = calendar.monthcalendar(year, month)
+    
+    # CSS pentru calendar
+    st.markdown("""
+    <style>
+    .calendar-container {
+        background: white;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .calendar-day {
+        border: 1px solid #e0e0e0;
+        padding: 10px;
+        min-height: 100px;
+        background: white;
+        border-radius: 5px;
+        margin: 2px;
+    }
+    .calendar-weekend {
+        background: #fff3cd !important;
+    }
+    .calendar-header {
+        font-weight: bold;
+        text-align: center;
+        padding: 10px;
+        background: #f8f9fa;
+        border-radius: 5px;
+    }
+    .shift-badge {
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 12px;
+        margin: 2px;
+        display: inline-block;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
     # Header zile
+    st.markdown('<div class="calendar-container">', unsafe_allow_html=True)
     cols = st.columns(7)
-    for i, day_name in enumerate(['L', 'M', 'M', 'J', 'V', 'S', 'D']):
+    for i, day_name in enumerate(['Luni', 'Marți', 'Miercuri', 'Joi', 'Vineri', 'Sâmbătă', 'Duminică']):
         with cols[i]:
-            st.markdown(f"**{day_name}**")
+            st.markdown(f'<div class="calendar-header">{day_name}</div>', unsafe_allow_html=True)
     
     # Zile calendar
     for week in cal:
         cols = st.columns(7)
         for i, day in enumerate(week):
             if day > 0:
-                day_date = date(today.year, today.month, day)
-                is_weekend = day_date.weekday() >= 5
+                day_date = date(year, month, day)
+                is_weekend = i >= 5
                 
                 with cols[i]:
-                    # Container pentru stilizare
-                    style = ""
-                    content = [f"**{day}**"]
+                    # Container pentru zi
+                    day_class = "calendar-day calendar-weekend" if is_weekend else "calendar-day"
                     
-                    # Verifică statusuri
-                    if day_date in unavailable_dates:
-                        style = "background-color: #f8d7da; border-radius: 5px; padding: 5px;"
-                        content.append("❌ Indisponibil")
-                    elif not my_reservations.empty:
-                        day_reservations = my_reservations[
-                            pd.to_datetime(my_reservations[COL_RES_DATE]).dt.date == day_date
-                        ]
-                        for _, res in day_reservations.iterrows():
-                            status_icon = "⏳" if res[COL_RES_STATUS] == 'pending' else "✅"
-                            shift_label = SHIFT_TYPES[res[COL_RES_SHIFT]].split('(')[0]
-                            content.append(f"{status_icon} {shift_label}")
-                    
-                    # Verifică program final
+                    # Găsește gărzi pentru această zi
                     if not schedule_df.empty:
                         day_schedule = schedule_df[
                             pd.to_datetime(schedule_df[COL_DATE]).dt.date == day_date
                         ]
-                        my_shifts = day_schedule[day_schedule[COL_DOC_ID] == doctor_id]
-                        for _, shift in my_shifts.iterrows():
-                            content.append(f"✅ {shift[COL_SHIFT].split('(')[0]}")
-                    
-                    if is_weekend:
-                        style = "background-color: #fff3cd; border-radius: 5px; padding: 5px;"
-                    
-                    # Afișare
-                    if style:
-                        st.markdown(f'<div style="{style}">' + '<br>'.join(content) + '</div>', 
-                                  unsafe_allow_html=True)
                     else:
-                        for line in content:
-                            st.markdown(line)
-
-def show_my_reservations(doctor_id, reservations_df):
-    """Afișează lista rezervărilor medicului."""
-    my_reservations = get_doctor_reservations(doctor_id, reservations_df)
-    
-    if my_reservations.empty:
-        st.info("Nu ai rezervări active.")
-        return
-    
-    st.subheader("📋 Rezervările tale")
-    
-    # Sortează după dată
-    my_reservations = my_reservations.sort_values(COL_RES_DATE)
-    
-    for idx, res in my_reservations.iterrows():
-        col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
-        
-        res_date = pd.to_datetime(res[COL_RES_DATE])
-        weekday = WEEKDAYS_RO[res_date.weekday()]
-        
-        with col1:
-            st.write(f"**{weekday}, {res_date.strftime('%d.%m.%Y')}**")
-        
-        with col2:
-            st.write(SHIFT_TYPES[res[COL_RES_SHIFT]])
-        
-        with col3:
-            status_map = {
-                'pending': '⏳ În așteptare',
-                'approved': '✅ Aprobat',
-                'rejected': '❌ Respins'
-            }
-            st.write(status_map.get(res[COL_RES_STATUS], res[COL_RES_STATUS]))
-        
-        with col4:
-            if res[COL_RES_STATUS] == 'pending':
-                if st.button("🗑️", key=f"del_res_{idx}"):
-                    reservations_df = reservations_df.drop(idx)
-                    save_data(SHEET_RESERVATIONS, reservations_df)
-                    st.rerun()
-
-# ──────────────────────────────────────────────────────────
-# Funcții Manager
-# ──────────────────────────────────────────────────────────
-def resolve_conflicts_and_generate(reservations_df, doctors_df, start_date, end_date, priorities_df):
-    """Rezolvă conflictele și generează programul final."""
-    schedule_rows = []
-    
-    # Grupează rezervările pe date
-    if not reservations_df.empty:
-        reservations_df['date_obj'] = pd.to_datetime(reservations_df[COL_RES_DATE])
-        pending_reservations = reservations_df[reservations_df[COL_RES_STATUS] == 'pending']
-    else:
-        pending_reservations = pd.DataFrame()
-    
-    # Pentru fiecare zi din perioada selectată
-    current_date = start_date
-    while current_date <= end_date:
-        # Găsește toate rezervările pentru această zi
-        if not pending_reservations.empty:
-            day_reservations = pending_reservations[
-                pending_reservations['date_obj'].dt.date == current_date
-            ]
-        else:
-            day_reservations = pd.DataFrame()
-        
-        # Procesează fiecare tip de gardă
-        for shift_key, shift_name in SHIFT_TYPES.items():
-            if not day_reservations.empty:
-                shift_requests = day_reservations[day_reservations[COL_RES_SHIFT] == shift_key]
+                        day_schedule = pd.DataFrame()
+                    
+                    # Afișare zi
+                    st.markdown(f'<div class="{day_class}">', unsafe_allow_html=True)
+                    st.markdown(f"**{day}**")
+                    
+                    # Afișare gărzi
+                    if not day_schedule.empty:
+                        for _, shift in day_schedule.iterrows():
+                            doc_name = id_to_name.get(shift[COL_DOC_ID], "?")
+                            shift_config = SHIFT_CONFIGS.get(shift[COL_SHIFT], {})
+                            icon = shift_config.get('icon', '⚪')
+                            
+                            st.markdown(f"{icon} {doc_name[:15]}")
+                    
+                    st.markdown('</div>', unsafe_allow_html=True)
             else:
-                shift_requests = pd.DataFrame()
-            
-            if len(shift_requests) == 0:
-                # Nu există rezervări - va fi completat automat mai târziu
-                continue
-            elif len(shift_requests) == 1:
-                # O singură cerere - aprobată automat
-                selected_doc = shift_requests.iloc[0][COL_RES_DOC]
-                schedule_rows.append({
-                    COL_DATE: current_date.strftime('%Y-%m-%d'),
-                    COL_SHIFT: shift_name,
-                    COL_DOC_ID: selected_doc
-                })
-                
-                # Actualizează status rezervare
-                idx = shift_requests.index[0]
-                reservations_df.loc[idx, COL_RES_STATUS] = 'approved'
-            else:
-                # Multiple cereri - rezolvare conflict
-                # Calculează prioritățile
-                month_key = f"{current_date.year}-{current_date.month:02d}"
-                candidates = []
-                
-                for _, req in shift_requests.iterrows():
-                    doc_id = req[COL_RES_DOC]
-                    
-                    # Obține scorul de prioritate
-                    if not priorities_df.empty:
-                        doc_priority = priorities_df[
-                            (priorities_df[COL_PRIO_DOC] == doc_id) & 
-                            (priorities_df[COL_PRIO_MONTH] == month_key)
-                        ]
-                        priority_score = doc_priority[COL_PRIO_SCORE].iloc[0] if not doc_priority.empty else 0
-                    else:
-                        priority_score = 0
-                    
-                    candidates.append((doc_id, priority_score))
-                
-                # Sortează după prioritate (descrescător) și alege random dintre cei cu prioritate egală
-                candidates.sort(key=lambda x: x[1], reverse=True)
-                max_priority = candidates[0][1]
-                top_candidates = [c[0] for c in candidates if c[1] == max_priority]
-                
-                # Alege random dintre candidații cu prioritate maximă
-                selected_doc = random.choice(top_candidates)
-                
-                schedule_rows.append({
-                    COL_DATE: current_date.strftime('%Y-%m-%d'),
-                    COL_SHIFT: shift_name,
-                    COL_DOC_ID: selected_doc
-                })
-                
-                # Actualizează statusuri
-                for _, req in shift_requests.iterrows():
-                    idx = shift_requests[shift_requests[COL_RES_DOC] == req[COL_RES_DOC]].index[0]
-                    if req[COL_RES_DOC] == selected_doc:
-                        reservations_df.loc[idx, COL_RES_STATUS] = 'approved'
-                    else:
-                        reservations_df.loc[idx, COL_RES_STATUS] = 'rejected'
-                        # Crește prioritatea pentru luna viitoare
-                        update_priority(req[COL_RES_DOC], current_date, priorities_df, increase=True)
-        
-        current_date += timedelta(days=1)
+                with cols[i]:
+                    st.write("")
     
-    return pd.DataFrame(schedule_rows), reservations_df, priorities_df
-
-def update_priority(doctor_id, date_obj, priorities_df, increase=True):
-    """Actualizează prioritatea unui medic."""
-    next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1)
-    month_key = f"{next_month.year}-{next_month.month:02d}"
-    
-    if priorities_df.empty:
-        priorities_df = pd.DataFrame(columns=[COL_PRIO_DOC, COL_PRIO_MONTH, COL_PRIO_SCORE])
-    
-    # Găsește sau creează înregistrarea
-    mask = (priorities_df[COL_PRIO_DOC] == doctor_id) & (priorities_df[COL_PRIO_MONTH] == month_key)
-    
-    if mask.any():
-        if increase:
-            priorities_df.loc[mask, COL_PRIO_SCORE] += 1
-        else:
-            priorities_df.loc[mask, COL_PRIO_SCORE] -= 1
-    else:
-        new_priority = pd.DataFrame([{
-            COL_PRIO_DOC: doctor_id,
-            COL_PRIO_MONTH: month_key,
-            COL_PRIO_SCORE: 1 if increase else 0
-        }])
-        priorities_df = pd.concat([priorities_df, new_priority], ignore_index=True)
-    
-    return priorities_df
-
-def fill_empty_shifts(schedule_df, doctors_df, start_date, end_date, unavail_df):
-    """Completează automat gărzile nerezervate."""
-    # Obține toate datele și tipurile de gărzi necesare
-    all_dates = pd.date_range(start_date, end_date)
-    
-    # Pentru fiecare zi verifică ce lipsește
-    for current_date in all_dates:
-        # Determină ce ture sunt necesare
-        if current_date.weekday() < 5:  # Zi lucrătoare
-            required_shifts = ["Gardă 24h"]  # Sau configurabil
-        else:
-            required_shifts = ["Gardă 24h"]
-        
-        # Verifică ce există deja
-        if not schedule_df.empty:
-            existing = schedule_df[
-                pd.to_datetime(schedule_df[COL_DATE]).dt.date == current_date.date()
-            ]
-            existing_shifts = existing[COL_SHIFT].tolist()
-        else:
-            existing_shifts = []
-        
-        # Completează ce lipsește
-        for shift in required_shifts:
-            if shift not in existing_shifts:
-                # Găsește un medic disponibil
-                available_doctors = []
-                
-                for _, doc in doctors_df.iterrows():
-                    doc_id = doc[COL_ID]
-                    
-                    # Verifică indisponibilitate
-                    if not unavail_df.empty:
-                        is_unavailable = any(
-                            (unavail_df['doctor_id'] == doc_id) & 
-                            (pd.to_datetime(unavail_df['date']).dt.date == current_date.date())
-                        )
-                        if is_unavailable:
-                            continue
-                    
-                    # Verifică limita lunară
-                    month_shifts = 0
-                    if not schedule_df.empty:
-                        month_mask = (
-                            (schedule_df[COL_DOC_ID] == doc_id) &
-                            (pd.to_datetime(schedule_df[COL_DATE]).dt.month == current_date.month) &
-                            (pd.to_datetime(schedule_df[COL_DATE]).dt.year == current_date.year)
-                        )
-                        month_shifts = len(schedule_df[month_mask])
-                    
-                    if month_shifts < doc[COL_MAX]:
-                        available_doctors.append(doc_id)
-                
-                # Alege un medic disponibil
-                if available_doctors:
-                    selected_doc = random.choice(available_doctors)
-                    new_shift = pd.DataFrame([{
-                        COL_DATE: current_date.strftime('%Y-%m-%d'),
-                        COL_SHIFT: shift,
-                        COL_DOC_ID: selected_doc
-                    }])
-                    
-                    if schedule_df.empty:
-                        schedule_df = new_shift
-                    else:
-                        schedule_df = pd.concat([schedule_df, new_shift], ignore_index=True)
-    
-    return schedule_df
-
-def show_manager_calendar_allocation(schedule_df, doctors_df):
-    """Interfață calendar pentru alocare manuală."""
-    st.subheader("📅 Alocare Manuală prin Calendar")
-    
-    # Selectori principali
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        selected_date = st.date_input(
-            "Selectează data:",
-            value=date.today(),
-            min_value=date.today()
-        )
-    
-    with col2:
-        shift_type = st.selectbox(
-            "Tip gardă:",
-            options=list(SHIFT_TYPES.values())
-        )
-    
-    # Verifică ce există deja pentru această dată
-    if not schedule_df.empty:
-        existing = schedule_df[
-            (pd.to_datetime(schedule_df[COL_DATE]).dt.date == selected_date) &
-            (schedule_df[COL_SHIFT] == shift_type)
-        ]
-        
-        if not existing.empty:
-            current_doc = existing.iloc[0][COL_DOC_ID]
-            st.warning(f"⚠️ Gardă deja alocată pentru {selected_date.strftime('%d.%m.%Y')}")
-        else:
-            current_doc = None
-    else:
-        current_doc = None
-    
-    # Selector medic
-    if not doctors_df.empty:
-        doctor_options = {
-            f"{doc[COL_NAME]} - {doc[COL_SPEC]}": doc[COL_ID]
-            for _, doc in doctors_df.iterrows()
-        }
-        
-        if current_doc:
-            current_doc_name = next(
-                (name for name, id in doctor_options.items() if id == current_doc),
-                None
-            )
-            default_index = list(doctor_options.keys()).index(current_doc_name) if current_doc_name else 0
-        else:
-            default_index = 0
-        
-        selected_doc_display = st.selectbox(
-            "Alege medicul:",
-            options=list(doctor_options.keys()),
-            index=default_index
-        )
-        selected_doc_id = doctor_options[selected_doc_display]
-        
-        # Butoane acțiune
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("💾 Salvează/Actualizează", type="primary", use_container_width=True):
-                # Elimină intrarea existentă dacă există
-                if not schedule_df.empty:
-                    schedule_df = schedule_df[
-                        ~((pd.to_datetime(schedule_df[COL_DATE]).dt.date == selected_date) &
-                          (schedule_df[COL_SHIFT] == shift_type))
-                    ]
-                
-                # Adaugă noua intrare
-                new_entry = pd.DataFrame([{
-                    COL_DATE: selected_date.strftime('%Y-%m-%d'),
-                    COL_SHIFT: shift_type,
-                    COL_DOC_ID: selected_doc_id
-                }])
-                
-                if schedule_df.empty:
-                    schedule_df = new_entry
-                else:
-                    schedule_df = pd.concat([schedule_df, new_entry], ignore_index=True)
-                
-                save_data(SHEET_SCHEDULE, schedule_df)
-                st.success("✅ Gardă salvată!")
-                st.rerun()
-        
-        with col2:
-            if current_doc and st.button("🗑️ Șterge", use_container_width=True):
-                schedule_df = schedule_df[
-                    ~((pd.to_datetime(schedule_df[COL_DATE]).dt.date == selected_date) &
-                      (schedule_df[COL_SHIFT] == shift_type))
-                ]
-                save_data(SHEET_SCHEDULE, schedule_df)
-                st.success("✅ Gardă ștearsă!")
-                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────
-# Vizualizare simplificată
+# Vizualizare Gantt cu Plotly
 # ──────────────────────────────────────────────────────────
-def show_schedule_view(schedule_df, doctors_df, start_date, end_date):
-    """Afișează programul într-un format tabel clar."""
+def show_gantt_view(schedule_df, doctors_df, start_date, end_date):
+    """Afișează programul ca diagramă Gantt folosind Plotly."""
     if schedule_df.empty:
-        st.info("Nu există program generat.")
+        st.info("📅 Nu există program generat pentru perioada selectată.")
         return
     
-    # Filtrează pentru perioada selectată
+    # Mapare ID -> Nume
+    id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+    
+    # Pregătește datele pentru Plotly
+    gantt_data = []
+    
+    for _, row in schedule_df.iterrows():
+        shift_date = pd.to_datetime(row[COL_DATE])
+        
+        # Filtrare pentru perioada selectată
+        if shift_date.date() < start_date or shift_date.date() > end_date:
+            continue
+            
+        doc_name = id_to_name.get(row[COL_DOC_ID], f"ID {row[COL_DOC_ID]}")
+        shift_type = row[COL_SHIFT]
+        shift_config = SHIFT_CONFIGS.get(shift_type, {})
+        
+        # Calculează start și end pentru tură
+        if "08-20" in shift_type:
+            start_time = shift_date.replace(hour=8, minute=0)
+            end_time = shift_date.replace(hour=20, minute=0)
+        elif "20-08" in shift_type:
+            start_time = shift_date.replace(hour=20, minute=0)
+            end_time = (shift_date + timedelta(days=1)).replace(hour=8, minute=0)
+        else:  # 24h
+            start_time = shift_date.replace(hour=8, minute=0)
+            end_time = (shift_date + timedelta(days=1)).replace(hour=8, minute=0)
+        
+        gantt_data.append({
+            'Task': doc_name,
+            'Start': start_time,
+            'Finish': end_time,
+            'Resource': shift_type,
+            'Color': shift_config.get('color', '#999999'),
+            'Text': f"{doc_name}<br>{shift_type}<br>{shift_date.strftime('%d.%m')}"
+        })
+    
+    if not gantt_data:
+        st.info("Nu există gărzi în perioada selectată.")
+        return
+    
+    # Creează DataFrame pentru Plotly
+    df_gantt = pd.DataFrame(gantt_data)
+    
+    # Creează figura Plotly
+    fig = px.timeline(
+        df_gantt,
+        x_start="Start",
+        x_end="Finish",
+        y="Task",
+        color="Resource",
+        color_discrete_map={k: v['color'] for k, v in SHIFT_CONFIGS.items()},
+        hover_data={"Text": True, "Start": True, "Finish": True},
+        title="Program Gărzi - Vizualizare Gantt"
+    )
+    
+    # Personalizare aspect
+    fig.update_yaxes(
+        autorange="reversed",
+        title="Personal Medical"
+    )
+    
+    fig.update_xaxis(
+        title="Data și Ora",
+        tickformat="%d %b\n%H:%M",
+        dtick=86400000,  # 1 zi în milisecunde
+        gridcolor='lightgray',
+        showgrid=True
+    )
+    
+    # Evidențiere weekend-uri
+    for i in range((end_date - start_date).days + 1):
+        current_date = start_date + timedelta(days=i)
+        if current_date.weekday() >= 5:  # Weekend
+            fig.add_vrect(
+                x0=current_date,
+                x1=current_date + timedelta(days=1),
+                fillcolor="yellow",
+                opacity=0.1,
+                layer="below",
+                line_width=0
+            )
+    
+    # Layout
+    fig.update_layout(
+        height=max(400, len(df_gantt['Task'].unique()) * 40),
+        showlegend=True,
+        hovermode='closest',
+        margin=dict(l=200, r=20, t=70, b=70),
+        plot_bgcolor='white'
+    )
+    
+    # Afișare
+    st.plotly_chart(fig, use_container_width=True)
+
+# ──────────────────────────────────────────────────────────
+# Vizualizare Tabel Simplu
+# ──────────────────────────────────────────────────────────
+def show_table_view(schedule_df, doctors_df, start_date, end_date):
+    """Afișează programul ca tabel simplu și clar."""
+    if schedule_df.empty:
+        st.info("📅 Nu există program generat.")
+        return
+    
+    # Mapare ID -> Nume
+    id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+    id_to_spec = dict(zip(doctors_df[COL_ID], doctors_df[COL_SPEC]))
+    
+    # Filtrare și pregătire date
+    schedule_df = schedule_df.copy()
     schedule_df['date_obj'] = pd.to_datetime(schedule_df[COL_DATE])
+    
+    # Filtrare pentru perioada selectată
     mask = (schedule_df['date_obj'].dt.date >= start_date) & (schedule_df['date_obj'].dt.date <= end_date)
     filtered = schedule_df[mask].copy()
     
@@ -737,21 +471,19 @@ def show_schedule_view(schedule_df, doctors_df, start_date, end_date):
         st.info("Nu există gărzi în perioada selectată.")
         return
     
-    # Mapare ID -> Nume
-    id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+    # Adaugă informații suplimentare
     filtered['Medic'] = filtered[COL_DOC_ID].map(id_to_name)
-    
-    # Formatare date
+    filtered['Specialitate'] = filtered[COL_DOC_ID].map(id_to_spec)
     filtered['Data'] = filtered['date_obj'].dt.strftime('%d.%m.%Y')
     filtered['Zi'] = filtered['date_obj'].apply(lambda x: WEEKDAYS_RO[x.weekday()])
     filtered['Weekend'] = filtered['date_obj'].dt.weekday >= 5
     
-    # Sortare
+    # Sortare după dată
     filtered = filtered.sort_values('date_obj')
     
-    # Afișare cu stilizare pentru weekend
+    # Afișare tabel stilizat
     for _, row in filtered.iterrows():
-        col1, col2, col3, col4 = st.columns([1, 2, 2, 3])
+        col1, col2, col3, col4, col5 = st.columns([1, 2, 2, 2, 3])
         
         with col1:
             if row['Weekend']:
@@ -763,274 +495,302 @@ def show_schedule_view(schedule_df, doctors_df, start_date, end_date):
             st.write(row['Data'])
         
         with col3:
-            # Icon pentru tip gardă
-            if "24h" in row[COL_SHIFT]:
-                st.write("🔴 " + row[COL_SHIFT])
-            elif "Zi" in row[COL_SHIFT]:
-                st.write("🟢 " + row[COL_SHIFT])
-            else:
-                st.write("🔵 " + row[COL_SHIFT])
+            shift_config = SHIFT_CONFIGS.get(row[COL_SHIFT], {})
+            icon = shift_config.get('icon', '⚪')
+            st.write(f"{icon} {row[COL_SHIFT].split('(')[0]}")
         
         with col4:
+            st.write(row['Specialitate'])
+        
+        with col5:
             st.write(f"**{row['Medic']}**")
         
         st.divider()
-
-# ──────────────────────────────────────────────────────────
-# Aplicația principală  
-# ──────────────────────────────────────────────────────────
-def main():
-    st.set_page_config(
-        page_title="🩺 Planificare Gărzi - Rezervări",
-        page_icon="🏥",
-        layout="wide"
-    )
     
-    # Verifică autentificarea
-    if not check_auth():
-        show_login()
-        return
+    # Statistici rezumat
+    st.subheader("📊 Rezumat Perioadă")
+    col1, col2, col3 = st.columns(3)
     
-    # Configurare spital
-    sheet_id = select_hospital()
-    st.session_state["sheet_id"] = sheet_id
-    
-    # Header cu rol și logout
-    col1, col2, col3 = st.columns([6, 1, 1])
     with col1:
-        hospitals = get_hospital_config()
-        hospital_name = hospitals.get(
-            st.session_state.get('selected_hospital', 'default'), {}
-        ).get('name', 'Spital')
-        st.title(f"🏥 Planificare Gărzi - {hospital_name}")
+        st.metric("Total Gărzi", len(filtered))
     
     with col2:
-        role = st.session_state.get('user_role', '')
-        if role == 'doctor':
-            st.write(f"👨‍⚕️ Dr. {st.session_state.get('doctor_name', '')}")
-        else:
-            st.write("👨‍💼 Manager")
+        weekend_count = len(filtered[filtered['Weekend']])
+        st.metric("Gărzi Weekend", weekend_count)
     
     with col3:
-        if st.button("🚪 Ieșire"):
-            logout()
+        unique_docs = filtered[COL_DOC_ID].nunique()
+        st.metric("Medici Activi", unique_docs)
+
+# ──────────────────────────────────────────────────────────
+# Funcții pentru Manager - Alocare simplă
+# ──────────────────────────────────────────────────────────
+def show_manager_allocation(schedule_df, doctors_df, unavail_df):
+    """Interfață simplă pentru alocare manuală de gărzi."""
+    st.subheader("🔧 Alocare Manuală Gărzi")
     
-    # Încarcă datele
-    doctors_df = load_data(SHEET_DOCTORS)
-    schedule_df = load_data(SHEET_SCHEDULE)
-    reservations_df = load_data(SHEET_RESERVATIONS)
-    priorities_df = load_data(SHEET_PRIORITIES)
-    unavail_df = load_data(SHEET_UNAVAILABLE)
+    # Formular pentru adăugare gardă
+    with st.form("add_shift_form"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            shift_date = st.date_input("Data:", value=date.today())
+        
+        with col2:
+            shift_type = st.selectbox("Tip gardă:", list(SHIFT_CONFIGS.keys()))
+        
+        with col3:
+            # Filtrare medici disponibili
+            available_doctors = get_available_doctors(doctors_df, unavail_df, shift_date)
+            
+            if available_doctors:
+                doctor_options = {
+                    f"{doc[COL_NAME]} - {doc[COL_SPEC]}": doc[COL_ID]
+                    for _, doc in available_doctors.iterrows()
+                }
+                
+                selected_doc_display = st.selectbox(
+                    "Medic:",
+                    list(doctor_options.keys())
+                )
+                selected_doc_id = doctor_options[selected_doc_display]
+            else:
+                st.warning("Nu există medici disponibili pentru această dată")
+                selected_doc_id = None
+        
+        submitted = st.form_submit_button("➕ Adaugă Gardă", type="primary")
+        
+        if submitted and selected_doc_id:
+            # Verifică dacă există deja
+            existing = schedule_df[
+                (pd.to_datetime(schedule_df[COL_DATE]).dt.date == shift_date) &
+                (schedule_df[COL_SHIFT] == shift_type)
+            ] if not schedule_df.empty else pd.DataFrame()
+            
+            if not existing.empty:
+                st.error("❌ Există deja o gardă de acest tip în această zi!")
+            else:
+                # Adaugă garda
+                new_shift = pd.DataFrame([{
+                    COL_DATE: shift_date.strftime('%Y-%m-%d'),
+                    COL_SHIFT: shift_type,
+                    COL_DOC_ID: selected_doc_id
+                }])
+                
+                if schedule_df.empty:
+                    schedule_df = new_shift
+                else:
+                    schedule_df = pd.concat([schedule_df, new_shift], ignore_index=True)
+                
+                # Salvează și reîncarcă
+                sheet_id = st.session_state.get('sheet_id')
+                if sheet_id:
+                    save_data(SHEET_SCHEDULE, schedule_df, sheet_id)
+                    st.success("✅ Gardă adăugată cu succes!")
+                    st.rerun()
+
+def get_available_doctors(doctors_df, unavail_df, check_date):
+    """Returnează medicii disponibili pentru o anumită dată."""
+    if doctors_df.empty:
+        return pd.DataFrame()
     
-    # Curățare date
+    available = doctors_df.copy()
+    
+    # Elimină medicii indisponibili
+    if not unavail_df.empty:
+        unavail_on_date = unavail_df[
+            pd.to_datetime(unavail_df['date']).dt.date == check_date
+        ]
+        
+        if not unavail_on_date.empty:
+            unavail_ids = unavail_on_date['doctor_id'].unique()
+            available = available[~available[COL_ID].isin(unavail_ids)]
+    
+    return available
+
+# ──────────────────────────────────────────────────────────
+# Generare automată simplă
+# ──────────────────────────────────────────────────────────
+def generate_schedule_simple(doctors_df, start_date, end_date, shift_types, unavail_df):
+    """Generează program simplu folosind Round-Robin."""
+    if doctors_df.empty:
+        st.error("❌ Nu există personal înregistrat!")
+        return pd.DataFrame()
+    
+    # Pregătește lista de medici și contoare
+    doctor_ids = doctors_df[COL_ID].tolist()
+    shifts_count = defaultdict(int)
+    max_shifts = dict(zip(doctors_df[COL_ID], doctors_df[COL_MAX]))
+    
+    # Generare program
+    schedule_rows = []
+    current_date = start_date
+    doctor_index = 0
+    
+    while current_date <= end_date:
+        for shift_type in shift_types:
+            # Găsește medic disponibil
+            attempts = 0
+            assigned = False
+            
+            while attempts < len(doctor_ids) and not assigned:
+                doc_id = doctor_ids[doctor_index % len(doctor_ids)]
+                
+                # Verifică disponibilitate
+                is_available = True
+                if not unavail_df.empty:
+                    unavail_check = unavail_df[
+                        (unavail_df['doctor_id'] == doc_id) &
+                        (pd.to_datetime(unavail_df['date']).dt.date == current_date)
+                    ]
+                    is_available = unavail_check.empty
+                
+                # Verifică limita lunară
+                month_key = f"{current_date.year}-{current_date.month}"
+                under_limit = shifts_count[f"{doc_id}_{month_key}"] < max_shifts.get(doc_id, 8)
+                
+                if is_available and under_limit:
+                    schedule_rows.append({
+                        COL_DATE: current_date.strftime('%Y-%m-%d'),
+                        COL_SHIFT: shift_type,
+                        COL_DOC_ID: doc_id
+                    })
+                    shifts_count[f"{doc_id}_{month_key}"] += 1
+                    assigned = True
+                
+                doctor_index += 1
+                attempts += 1
+            
+            if not assigned:
+                st.warning(f"⚠️ Nu s-a găsit medic pentru {current_date.strftime('%d.%m.%Y')} - {shift_type}")
+        
+        current_date += timedelta(days=1)
+    
+    return pd.DataFrame(schedule_rows)
+
+# ──────────────────────────────────────────────────────────
+# Aplicația principală
+# ──────────────────────────────────────────────────────────
+def main():
+    # Inițializare session state
+    init_session_state()
+    
+    # Configurare spital
+    hospitals = get_hospital_config()
+    
+    # Selector spital (în sidebar dacă sunt mai multe)
+    if len(hospitals) > 1:
+        with st.sidebar:
+            st.markdown("### 🏥 Selectează Spitalul")
+            selected_hospital = st.selectbox(
+                "Spital:",
+                options=list(hospitals.keys()),
+                format_func=lambda x: hospitals[x]["name"]
+            )
+    else:
+        selected_hospital = list(hospitals.keys())[0]
+    
+    sheet_id = hospitals[selected_hospital]["sheet_id"]
+    st.session_state['sheet_id'] = sheet_id
+    hospital_name = hospitals[selected_hospital]["name"]
+    
+    # Header principal
+    st.title(f"🏥 {hospital_name} - Planificare Gărzi")
+    
+    # Încarcă datele cu caching
+    doctors_df = load_data(SHEET_DOCTORS, sheet_id)
+    schedule_df = load_data(SHEET_SCHEDULE, sheet_id)
+    unavail_df = load_data(SHEET_UNAVAILABLE, sheet_id)
+    
+    # Curățare date medici
     if not doctors_df.empty:
         doctors_df[COL_ID] = pd.to_numeric(doctors_df[COL_ID], errors='coerce').fillna(0).astype(int)
         doctors_df = doctors_df[doctors_df[COL_ID] > 0]
         doctors_df[COL_MAX] = pd.to_numeric(doctors_df[COL_MAX], errors='coerce').fillna(8).astype(int)
     
-    # Interfață bazată pe rol
-    if st.session_state['user_role'] == 'doctor':
-        # INTERFAȚĂ MEDIC
-        tabs = st.tabs(["📅 Rezervări", "📋 Rezervările Mele", "🚫 Indisponibilități", "📊 Program Final"])
-        
-        with tabs[0]:
-            show_reservation_calendar(
-                st.session_state['doctor_id'],
-                st.session_state['doctor_name'],
-                reservations_df,
-                unavail_df,
-                schedule_df
-            )
-        
-        with tabs[1]:
-            show_my_reservations(st.session_state['doctor_id'], reservations_df)
-        
-        with tabs[2]:
-            st.subheader("🚫 Marchează Indisponibilități")
-            st.info("Selectează zilele când NU poți lua gărzi")
-            
-            # Calendar pentru indisponibilități
-            selected_dates = st.date_input(
-                "Selectează datele:",
-                value=[],
-                min_value=date.today(),
-                max_value=date.today() + timedelta(days=90),
-                key="unavail_dates"
-            )
-            
-            if st.button("💾 Salvează Indisponibilități"):
-                # Șterge indisponibilitățile vechi
-                if not unavail_df.empty:
-                    unavail_df = unavail_df[unavail_df['doctor_id'] != st.session_state['doctor_id']]
-                
-                # Adaugă cele noi
-                for sel_date in selected_dates:
-                    new_unavail = pd.DataFrame([{
-                        'doctor_id': st.session_state['doctor_id'],
-                        'date': sel_date.strftime('%Y-%m-%d'),
-                        'reason': 'Indisponibil'
-                    }])
-                    
-                    if unavail_df.empty:
-                        unavail_df = new_unavail
-                    else:
-                        unavail_df = pd.concat([unavail_df, new_unavail], ignore_index=True)
-                
-                save_data(SHEET_UNAVAILABLE, unavail_df)
-                st.success("✅ Indisponibilități salvate!")
-                st.rerun()
-        
-        with tabs[3]:
-            st.subheader("📊 Program Final")
-            
-            if not schedule_df.empty:
-                my_shifts = schedule_df[schedule_df[COL_DOC_ID] == st.session_state['doctor_id']]
-                
-                if not my_shifts.empty:
-                    my_shifts = my_shifts.sort_values(COL_DATE)
-                    
-                    st.metric("Total gărzi:", len(my_shifts))
-                    
-                    for _, shift in my_shifts.iterrows():
-                        shift_date = pd.to_datetime(shift[COL_DATE])
-                        weekday = WEEKDAYS_RO[shift_date.weekday()]
-                        
-                        col1, col2, col3 = st.columns([2, 1, 2])
-                        with col1:
-                            st.write(f"**{weekday}, {shift_date.strftime('%d.%m.%Y')}**")
-                        with col2:
-                            if shift_date.weekday() >= 5:
-                                st.write("🟡 Weekend")
-                        with col3:
-                            st.write(shift[COL_SHIFT])
-                else:
-                    st.info("Nu ai gărzi alocate încă.")
-            else:
-                st.info("Programul final nu a fost generat încă.")
+    # Selector utilizator
+    create_user_selector(doctors_df)
     
-    else:  # MANAGER
-        # INTERFAȚĂ MANAGER
-        with st.sidebar:
-            st.header("⚙️ Opțiuni Manager")
-            
-            # Generare automată
-            st.subheader("🤖 Generare Automată")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input("De la:", value=date.today())
-            with col2:
-                end_date = st.date_input("Până la:", value=date.today() + timedelta(days=30))
-            
-            if st.button("🚀 Generează Program", type="primary", use_container_width=True):
-                with st.spinner("Procesez rezervările și generez programul..."):
-                    # 1. Rezolvă conflictele din rezervări
-                    schedule_df, updated_reservations, updated_priorities = resolve_conflicts_and_generate(
-                        reservations_df, doctors_df, start_date, end_date, priorities_df
-                    )
-                    
-                    # 2. Completează gărzile lipsă
-                    schedule_df = fill_empty_shifts(
-                        schedule_df, doctors_df, start_date, end_date, unavail_df
-                    )
-                    
-                    # 3. Salvează toate modificările
-                    save_data(SHEET_SCHEDULE, schedule_df)
-                    save_data(SHEET_RESERVATIONS, updated_reservations)
-                    save_data(SHEET_PRIORITIES, updated_priorities)
-                    
-                    st.success("✅ Program generat cu succes!")
-                    st.balloons()
-                    st.rerun()
-            
-            # Export
-            st.divider()
-            if not schedule_df.empty:
-                # Generare text export
-                export_text = "PROGRAM GĂRZI MEDICALE\n"
-                export_text += "=" * 50 + "\n\n"
-                export_text += f"Generat: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-                
-                id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
-                schedule_sorted = schedule_df.sort_values(COL_DATE)
-                
-                for _, row in schedule_sorted.iterrows():
-                    date_obj = pd.to_datetime(row[COL_DATE])
-                    weekday = WEEKDAYS_RO[date_obj.weekday()]
-                    doc_name = id_to_name.get(row[COL_DOC_ID], "Necunoscut")
-                    export_text += f"{weekday}, {date_obj.strftime('%d.%m.%Y')} - {row[COL_SHIFT]}: {doc_name}\n"
-                
-                st.download_button(
-                    "📥 Export .txt",
-                    export_text,
-                    f"program_{date.today()}.txt",
-                    "text/plain",
-                    use_container_width=True
-                )
+    # Tabs principale
+    if st.session_state.user_role == 'manager':
+        tabs = st.tabs(["📅 Calendar", "📊 Gantt", "📋 Tabel", "🔧 Alocare", "👥 Personal", "⚙️ Generare"])
+    elif st.session_state.user_role == 'doctor':
+        tabs = st.tabs(["📅 Calendar", "📊 Gantt", "📋 Tabel", "🚫 Indisponibilități"])
+    else:
+        tabs = st.tabs(["📅 Calendar", "📊 Gantt", "📋 Tabel"])
+    
+    # Tab Calendar
+    with tabs[0]:
+        st.header("📅 Vizualizare Calendar")
+        show_calendar_view(
+            schedule_df, 
+            doctors_df,
+            st.session_state.selected_month,
+            st.session_state.selected_year
+        )
+    
+    # Tab Gantt
+    with tabs[1]:
+        st.header("📊 Diagramă Gantt")
         
-        # Tabs manager
-        tabs = st.tabs([
-            "📅 Program", 
-            "🔧 Alocare Manuală",
-            "📋 Rezervări",
-            "👨‍⚕️ Personal",
-            "📊 Statistici"
-        ])
+        # Selector perioadă
+        col1, col2 = st.columns(2)
+        with col1:
+            gantt_start = st.date_input("De la:", value=date.today(), key="gantt_start")
+        with col2:
+            gantt_end = st.date_input("Până la:", value=date.today() + timedelta(days=14), key="gantt_end")
         
-        with tabs[0]:
-            st.header("📅 Vizualizare Program")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                view_start = st.date_input("De la:", value=date.today())
-            with col2:
-                view_end = st.date_input("Până la:", value=date.today() + timedelta(days=14))
-            
-            show_schedule_view(schedule_df, doctors_df, view_start, view_end)
+        show_gantt_view(schedule_df, doctors_df, gantt_start, gantt_end)
+    
+    # Tab Tabel
+    with tabs[2]:
+        st.header("📋 Vizualizare Tabel")
         
-        with tabs[1]:
-            show_manager_calendar_allocation(schedule_df, doctors_df)
+        # Selector perioadă
+        col1, col2 = st.columns(2)
+        with col1:
+            table_start = st.date_input("De la:", value=date.today(), key="table_start")
+        with col2:
+            table_end = st.date_input("Până la:", value=date.today() + timedelta(days=30), key="table_end")
         
-        with tabs[2]:
-            st.header("📋 Gestionare Rezervări")
-            
-            if not reservations_df.empty:
-                # Filtrare după status
-                status_filter = st.selectbox(
-                    "Filtrează după status:",
-                    ["Toate", "În așteptare", "Aprobate", "Respinse"],
-                    index=0
-                )
-                
-                if status_filter == "În așteptare":
-                    filtered_res = reservations_df[reservations_df[COL_RES_STATUS] == 'pending']
-                elif status_filter == "Aprobate":
-                    filtered_res = reservations_df[reservations_df[COL_RES_STATUS] == 'approved']
-                elif status_filter == "Respinse":
-                    filtered_res = reservations_df[reservations_df[COL_RES_STATUS] == 'rejected']
-                else:
-                    filtered_res = reservations_df
-                
-                if not filtered_res.empty:
-                    # Adaugă nume medici
-                    id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
-                    filtered_res['Medic'] = filtered_res[COL_RES_DOC].map(id_to_name)
-                    filtered_res['Data'] = pd.to_datetime(filtered_res[COL_RES_DATE]).dt.strftime('%d.%m.%Y')
-                    filtered_res['Gardă'] = filtered_res[COL_RES_SHIFT].map(SHIFT_TYPES)
-                    
-                    # Afișare
-                    st.dataframe(
-                        filtered_res[['Data', 'Medic', 'Gardă', COL_RES_STATUS]],
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("Nu există rezervări pentru acest filtru.")
-            else:
-                st.info("Nu există rezervări.")
-        
+        show_table_view(schedule_df, doctors_df, table_start, table_end)
+    
+    # Funcționalități Manager
+    if st.session_state.user_role == 'manager':
+        # Tab Alocare
         with tabs[3]:
-            st.header("👨‍⚕️ Gestionare Personal")
+            st.header("🔧 Alocare Manuală")
+            show_manager_allocation(schedule_df, doctors_df, unavail_df)
+            
+            # Ștergere gărzi
+            if not schedule_df.empty:
+                st.divider()
+                st.subheader("🗑️ Ștergere Gărzi")
+                
+                # Pregătește date pentru afișare
+                delete_df = schedule_df.copy()
+                id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+                delete_df['Medic'] = delete_df[COL_DOC_ID].map(id_to_name)
+                delete_df['Data'] = pd.to_datetime(delete_df[COL_DATE]).dt.strftime('%d.%m.%Y')
+                delete_df = delete_df.sort_values(COL_DATE, ascending=False).head(20)
+                
+                for idx, row in delete_df.iterrows():
+                    col1, col2, col3, col4 = st.columns([2, 3, 3, 1])
+                    with col1:
+                        st.write(row['Data'])
+                    with col2:
+                        st.write(row[COL_SHIFT])
+                    with col3:
+                        st.write(row['Medic'])
+                    with col4:
+                        if st.button("🗑️", key=f"del_{idx}"):
+                            schedule_df = schedule_df.drop(idx)
+                            save_data(SHEET_SCHEDULE, schedule_df, sheet_id)
+                            st.rerun()
+        
+        # Tab Personal
+        with tabs[4]:
+            st.header("👥 Gestionare Personal")
             
             if doctors_df.empty:
                 doctors_df = pd.DataFrame(columns=[COL_ID, COL_NAME, COL_SPEC, COL_MAX, COL_PHONE, COL_EMAIL])
@@ -1054,47 +814,135 @@ def main():
                 if edited[COL_ID].duplicated().any():
                     st.error("❌ Există ID-uri duplicate!")
                 else:
-                    save_data(SHEET_DOCTORS, edited)
-                    st.success("✅ Lista salvată!")
+                    save_data(SHEET_DOCTORS, edited, sheet_id)
+                    st.success("✅ Lista personal salvată!")
                     st.rerun()
         
-        with tabs[4]:
-            st.header("📊 Statistici")
+        # Tab Generare
+        with tabs[5]:
+            st.header("⚙️ Generare Automată")
             
-            if not schedule_df.empty:
-                col1, col2, col3, col4 = st.columns(4)
+            col1, col2 = st.columns(2)
+            with col1:
+                gen_start = st.date_input("De la:", value=date.today())
+            with col2:
+                gen_end = st.date_input("Până la:", value=date.today() + timedelta(days=30))
+            
+            # Selectare tipuri de ture
+            st.subheader("Tipuri de ture")
+            selected_shifts = st.multiselect(
+                "Selectează turele necesare:",
+                options=list(SHIFT_CONFIGS.keys()),
+                default=["Gardă 24h"]
+            )
+            
+            if st.button("🚀 Generează Program", type="primary", use_container_width=True):
+                if gen_start <= gen_end and selected_shifts:
+                    with st.spinner("Generez programul..."):
+                        new_schedule = generate_schedule_simple(
+                            doctors_df, gen_start, gen_end, selected_shifts, unavail_df
+                        )
+                        
+                        if not new_schedule.empty:
+                            save_data(SHEET_SCHEDULE, new_schedule, sheet_id)
+                            st.success("✅ Program generat cu succes!")
+                            st.balloons()
+                            st.rerun()
+                else:
+                    st.error("❌ Verifică datele selectate!")
+    
+    # Funcționalități Medic
+    if st.session_state.user_role == 'doctor' and st.session_state.selected_user:
+        with tabs[3]:
+            st.header("🚫 Gestionare Indisponibilități")
+            
+            doc_id = st.session_state.selected_user['id']
+            doc_name = st.session_state.selected_user['name']
+            
+            st.subheader(f"Indisponibilități pentru {doc_name}")
+            
+            # Calendar pentru selectare
+            selected_dates = st.date_input(
+                "Selectează zilele când NU poți lua gărzi:",
+                value=[],
+                min_value=date.today(),
+                max_value=date.today() + timedelta(days=90),
+                key="unavail_dates"
+            )
+            
+            if st.button("💾 Salvează Indisponibilități", type="primary"):
+                # Șterge indisponibilitățile vechi ale medicului
+                if not unavail_df.empty:
+                    unavail_df = unavail_df[unavail_df['doctor_id'] != doc_id]
                 
-                with col1:
-                    st.metric("Total Gărzi", len(schedule_df))
+                # Adaugă cele noi
+                new_unavail_rows = []
+                for sel_date in selected_dates:
+                    new_unavail_rows.append({
+                        'doctor_id': doc_id,
+                        'date': sel_date.strftime('%Y-%m-%d'),
+                        'reason': 'Indisponibil'
+                    })
                 
-                with col2:
-                    unique_docs = schedule_df[COL_DOC_ID].nunique()
-                    st.metric("Medici Activi", unique_docs)
+                if new_unavail_rows:
+                    new_unavail = pd.DataFrame(new_unavail_rows)
+                    if unavail_df.empty:
+                        unavail_df = new_unavail
+                    else:
+                        unavail_df = pd.concat([unavail_df, new_unavail], ignore_index=True)
                 
-                with col3:
-                    if not reservations_df.empty:
-                        pending = len(reservations_df[reservations_df[COL_RES_STATUS] == 'pending'])
-                        st.metric("Rezervări În Așteptare", pending)
+                save_data(SHEET_UNAVAILABLE, unavail_df, sheet_id)
+                st.success("✅ Indisponibilități salvate!")
+                st.rerun()
+            
+            # Afișare indisponibilități curente
+            if not unavail_df.empty:
+                my_unavail = unavail_df[unavail_df['doctor_id'] == doc_id]
+                if not my_unavail.empty:
+                    st.divider()
+                    st.write("**Zile marcate ca indisponibile:**")
+                    dates = pd.to_datetime(my_unavail['date']).dt.strftime('%d.%m.%Y')
+                    st.write(", ".join(dates.tolist()))
+    
+    # Export funcționalitate (pentru toți utilizatorii)
+    with st.sidebar:
+        st.divider()
+        st.subheader("📤 Export")
+        
+        if not schedule_df.empty:
+            # Generare text pentru export
+            export_text = f"PROGRAM GĂRZI - {hospital_name}\n"
+            export_text += "=" * 50 + "\n\n"
+            export_text += f"Generat: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+            
+            # Sortare și formatare
+            id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
+            schedule_sorted = schedule_df.sort_values(COL_DATE)
+            
+            current_month = None
+            for _, row in schedule_sorted.iterrows():
+                date_obj = pd.to_datetime(row[COL_DATE])
                 
-                with col4:
-                    weekend_shifts = len(schedule_df[
-                        pd.to_datetime(schedule_df[COL_DATE]).dt.weekday >= 5
-                    ])
-                    st.metric("Gărzi Weekend", weekend_shifts)
+                # Header lună nouă
+                if date_obj.month != current_month:
+                    current_month = date_obj.month
+                    export_text += f"\n--- {calendar.month_name[current_month]} {date_obj.year} ---\n\n"
                 
-                # Distribuție pe medici
-                st.divider()
-                st.subheader("Distribuție Gărzi")
+                weekday = WEEKDAYS_RO[date_obj.weekday()]
+                doc_name = id_to_name.get(row[COL_DOC_ID], "Necunoscut")
                 
-                stats = schedule_df[COL_DOC_ID].value_counts()
-                id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
-                
-                stats_df = pd.DataFrame({
-                    'Medic': [id_to_name.get(doc_id, f"ID {doc_id}") for doc_id in stats.index],
-                    'Total': stats.values
-                })
-                
-                st.bar_chart(stats_df.set_index('Medic'))
+                export_text += f"{weekday}, {date_obj.strftime('%d.%m.%Y')}: {row[COL_SHIFT]} - {doc_name}\n"
+            
+            # Buton download
+            st.download_button(
+                "📥 Descarcă Program (.txt)",
+                export_text,
+                f"program_{date.today()}.txt",
+                "text/plain",
+                use_container_width=True
+            )
+        else:
+            st.info("Nu există program de exportat")
 
 if __name__ == "__main__":
     main()
