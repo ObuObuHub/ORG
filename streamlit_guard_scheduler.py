@@ -11,8 +11,6 @@ import numpy as np
 from datetime import datetime, timedelta, date
 import gspread
 from google.oauth2.service_account import Credentials
-import plotly.express as px
-import plotly.graph_objects as go
 from collections import defaultdict
 import calendar
 
@@ -343,10 +341,10 @@ def show_calendar_view(schedule_df, doctors_df, selected_month, selected_year):
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────
-# Vizualizare Gantt cu Plotly
+# Vizualizare Gantt cu Streamlit nativ
 # ──────────────────────────────────────────────────────────
 def show_gantt_view(schedule_df, doctors_df, start_date, end_date):
-    """Afișează programul ca diagramă Gantt folosind Plotly."""
+    """Afișează programul ca diagramă Gantt folosind componente Streamlit native."""
     if schedule_df.empty:
         st.info("📅 Nu există program generat pentru perioada selectată.")
         return
@@ -354,97 +352,174 @@ def show_gantt_view(schedule_df, doctors_df, start_date, end_date):
     # Mapare ID -> Nume
     id_to_name = dict(zip(doctors_df[COL_ID], doctors_df[COL_NAME]))
     
-    # Pregătește datele pentru Plotly
-    gantt_data = []
+    # Filtrare date pentru perioada selectată
+    schedule_df = schedule_df.copy()
+    schedule_df['date_obj'] = pd.to_datetime(schedule_df[COL_DATE])
+    mask = (schedule_df['date_obj'].dt.date >= start_date) & (schedule_df['date_obj'].dt.date <= end_date)
+    filtered = schedule_df[mask]
     
-    for _, row in schedule_df.iterrows():
-        shift_date = pd.to_datetime(row[COL_DATE])
-        
-        # Filtrare pentru perioada selectată
-        if shift_date.date() < start_date or shift_date.date() > end_date:
-            continue
-            
-        doc_name = id_to_name.get(row[COL_DOC_ID], f"ID {row[COL_DOC_ID]}")
-        shift_type = row[COL_SHIFT]
-        shift_config = SHIFT_CONFIGS.get(shift_type, {})
-        
-        # Calculează start și end pentru tură
-        if "08-20" in shift_type:
-            start_time = shift_date.replace(hour=8, minute=0)
-            end_time = shift_date.replace(hour=20, minute=0)
-        elif "20-08" in shift_type:
-            start_time = shift_date.replace(hour=20, minute=0)
-            end_time = (shift_date + timedelta(days=1)).replace(hour=8, minute=0)
-        else:  # 24h
-            start_time = shift_date.replace(hour=8, minute=0)
-            end_time = (shift_date + timedelta(days=1)).replace(hour=8, minute=0)
-        
-        gantt_data.append({
-            'Task': doc_name,
-            'Start': start_time,
-            'Finish': end_time,
-            'Resource': shift_type,
-            'Color': shift_config.get('color', '#999999'),
-            'Text': f"{doc_name}<br>{shift_type}<br>{shift_date.strftime('%d.%m')}"
-        })
-    
-    if not gantt_data:
+    if filtered.empty:
         st.info("Nu există gărzi în perioada selectată.")
         return
     
-    # Creează DataFrame pentru Plotly
-    df_gantt = pd.DataFrame(gantt_data)
+    # Obține lista unică de medici din perioada selectată
+    unique_doctors = filtered[COL_DOC_ID].unique()
+    doctor_names = [id_to_name.get(doc_id, f"ID {doc_id}") for doc_id in unique_doctors]
     
-    # Creează figura Plotly
-    fig = px.timeline(
-        df_gantt,
-        x_start="Start",
-        x_end="Finish",
-        y="Task",
-        color="Resource",
-        color_discrete_map={k: v['color'] for k, v in SHIFT_CONFIGS.items()},
-        hover_data={"Text": True, "Start": True, "Finish": True},
-        title="Program Gărzi - Vizualizare Gantt"
-    )
+    # Calculează numărul de zile
+    date_range = pd.date_range(start_date, end_date)
+    num_days = len(date_range)
     
-    # Personalizare aspect
-    fig.update_yaxes(
-        autorange="reversed",
-        title="Personal Medical"
-    )
+    # CSS pentru Gantt
+    st.markdown("""
+    <style>
+    .gantt-container {
+        background: white;
+        border-radius: 8px;
+        padding: 10px;
+        overflow-x: auto;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .gantt-header {
+        display: grid;
+        grid-template-columns: 150px repeat(""" + str(num_days) + """, 80px);
+        border-bottom: 2px solid #333;
+        font-weight: bold;
+        position: sticky;
+        top: 0;
+        background: white;
+        z-index: 10;
+    }
+    .gantt-row {
+        display: grid;
+        grid-template-columns: 150px repeat(""" + str(num_days) + """, 80px);
+        border-bottom: 1px solid #eee;
+        min-height: 40px;
+        align-items: center;
+    }
+    .gantt-cell {
+        padding: 5px;
+        border-right: 1px solid #f0f0f0;
+        text-align: center;
+        position: relative;
+    }
+    .gantt-name {
+        font-weight: bold;
+        text-align: left;
+        background: #f8f9fa;
+        position: sticky;
+        left: 0;
+        z-index: 5;
+    }
+    .gantt-weekend {
+        background: #fff3cd;
+    }
+    .shift-block {
+        padding: 2px 4px;
+        border-radius: 4px;
+        font-size: 11px;
+        color: white;
+        margin: 1px;
+    }
+    .shift-24h {
+        background: #DC3545;
+    }
+    .shift-day {
+        background: #28A745;
+    }
+    .shift-night {
+        background: #17A2B8;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    fig.update_xaxis(
-        title="Data și Ora",
-        tickformat="%d %b\n%H:%M",
-        dtick=86400000,  # 1 zi în milisecunde
-        gridcolor='lightgray',
-        showgrid=True
-    )
+    # Construiește tabelul Gantt
+    st.markdown('<div class="gantt-container">', unsafe_allow_html=True)
     
-    # Evidențiere weekend-uri
-    for i in range((end_date - start_date).days + 1):
-        current_date = start_date + timedelta(days=i)
-        if current_date.weekday() >= 5:  # Weekend
-            fig.add_vrect(
-                x0=current_date,
-                x1=current_date + timedelta(days=1),
-                fillcolor="yellow",
-                opacity=0.1,
-                layer="below",
-                line_width=0
-            )
+    # Header cu datele
+    header_html = '<div class="gantt-header">'
+    header_html += '<div class="gantt-cell gantt-name">Personal Medical</div>'
     
-    # Layout
-    fig.update_layout(
-        height=max(400, len(df_gantt['Task'].unique()) * 40),
-        showlegend=True,
-        hovermode='closest',
-        margin=dict(l=200, r=20, t=70, b=70),
-        plot_bgcolor='white'
-    )
+    for d in date_range:
+        weekday = WEEKDAYS_RO[d.weekday()]
+        weekend_class = "gantt-weekend" if d.weekday() >= 5 else ""
+        header_html += f'''
+        <div class="gantt-cell {weekend_class}">
+            <div>{d.day}.{d.month}</div>
+            <div style="font-size: 10px; color: #666;">{weekday[:3]}</div>
+        </div>
+        '''
+    header_html += '</div>'
+    st.markdown(header_html, unsafe_allow_html=True)
     
-    # Afișare
-    st.plotly_chart(fig, use_container_width=True)
+    # Rânduri pentru fiecare medic
+    for doc_id, doc_name in zip(unique_doctors, doctor_names):
+        row_html = '<div class="gantt-row">'
+        row_html += f'<div class="gantt-cell gantt-name">{doc_name}</div>'
+        
+        # Pentru fiecare zi
+        for d in date_range:
+            weekend_class = "gantt-weekend" if d.weekday() >= 5 else ""
+            
+            # Găsește gărzile pentru acest medic în această zi
+            day_shifts = filtered[
+                (filtered[COL_DOC_ID] == doc_id) & 
+                (filtered['date_obj'].dt.date == d.date())
+            ]
+            
+            row_html += f'<div class="gantt-cell {weekend_class}">'
+            
+            for _, shift in day_shifts.iterrows():
+                shift_type = shift[COL_SHIFT]
+                
+                # Determină clasa CSS și textul
+                if "24h" in shift_type:
+                    shift_class = "shift-24h"
+                    display_text = "24h"
+                elif "Zi" in shift_type:
+                    shift_class = "shift-day"
+                    display_text = "08-20"
+                else:
+                    shift_class = "shift-night"
+                    display_text = "20-08"
+                
+                row_html += f'<div class="shift-block {shift_class}">{display_text}</div>'
+            
+            row_html += '</div>'
+        
+        row_html += '</div>'
+        st.markdown(row_html, unsafe_allow_html=True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Legendă
+    st.markdown("""
+    <div style="margin-top: 20px; padding: 10px; background: #f8f9fa; border-radius: 5px;">
+        <strong>Legendă:</strong>
+        <span class="shift-block shift-24h" style="display: inline-block; margin: 0 10px;">Gardă 24h</span>
+        <span class="shift-block shift-day" style="display: inline-block; margin: 0 10px;">Gardă Zi</span>
+        <span class="shift-block shift-night" style="display: inline-block; margin: 0 10px;">Gardă Noapte</span>
+        <span style="background: #fff3cd; padding: 2px 8px; margin: 0 10px; border: 1px solid #ddd; display: inline-block;">Weekend</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Statistici pentru perioada selectată
+    st.divider()
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        total_shifts = len(filtered)
+        st.metric("Total Gărzi", total_shifts)
+    
+    with col2:
+        unique_docs_period = filtered[COL_DOC_ID].nunique()
+        st.metric("Medici Activi", unique_docs_period)
+    
+    with col3:
+        # Calculează distribuția pe tipuri de gărzi
+        shift_distribution = filtered[COL_SHIFT].value_counts()
+        most_common = shift_distribution.index[0] if not shift_distribution.empty else "N/A"
+        st.metric("Tip Gardă Predominant", most_common.split('(')[0])
 
 # ──────────────────────────────────────────────────────────
 # Vizualizare Tabel Simplu
